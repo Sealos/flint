@@ -82,6 +82,9 @@ pub struct LoadedKubeconfig {
     pub user_sources: HashMap<String, PathBuf>,
     /// The files that parsed to nothing at all: no document, or only comments and whitespace.
     pub blank: Vec<PathBuf>,
+    /// The generation of the proxy setting each context's [`ContextInfo::proxy_url`] was chosen
+    /// under: a context is connected only under the setting it was loaded with.
+    pub proxy_generation: u64,
 }
 
 impl LoadedKubeconfig {
@@ -307,7 +310,8 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
             });
         }
     }
-    let environment = crate::connection::proxy::ProxyEnvironment::current();
+    let (proxy_generation, environment) =
+        crate::connection::proxy::ProxyEnvironment::current_with_generation();
     // Once per distinct proxy URL in a load, since each one with an account reads the route key.
     let mut identities: HashMap<String, String> = HashMap::new();
     for info in &mut contexts {
@@ -340,6 +344,7 @@ pub fn load(paths: &[PathBuf]) -> LoadedKubeconfig {
         cluster_sources,
         user_sources,
         blank,
+        proxy_generation,
     }
 }
 
@@ -637,6 +642,7 @@ impl FileRead {
             loaded: LoadedKubeconfig {
                 paths: paths.to_vec(),
                 errors: paths.iter().map(failed).collect(),
+                proxy_generation: crate::connection::proxy::generation(),
                 ..LoadedKubeconfig::default()
             },
             exist: paths.iter().map(|p| (p.clone(), true)).collect(),

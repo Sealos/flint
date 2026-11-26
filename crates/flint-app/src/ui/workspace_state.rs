@@ -98,12 +98,18 @@ impl Workspace {
             ));
         }
 
-        let list = self.list.as_ref().map(|l| l.read(cx));
-        let detail = self.detail.as_ref().map(|d| d.read(cx));
+        // Home covers the header, the list and the detail.
+        let covered = self.home.open && self.home_shown(cx);
+        let list = self.list.as_ref().filter(|_| !covered).map(|l| l.read(cx));
+        let detail = self
+            .detail
+            .as_ref()
+            .filter(|_| !covered)
+            .map(|d| d.read(cx));
         let active_cluster = model.active_cluster();
         let main = match active_cluster.map(|c| &c.state) {
             None if model.loaded && model.clusters.is_empty() => Main::NoContexts,
-            None => Main::NoCluster,
+            None => self.home_state(cx),
             Some(ConnectionState::Failed(e)) => Main::Failed {
                 error: connection_error_text(e),
             },
@@ -116,10 +122,12 @@ impl Workspace {
         };
         let main = if self.settings_page.open {
             Main::Settings
+        } else if covered {
+            self.home_state(cx)
         } else {
             main
         };
-        let header = active_cluster.map(|cluster| {
+        let header = active_cluster.filter(|_| !covered).map(|cluster| {
             let name = &cluster.info.name;
             let filter = self.ui_state.namespace_filter(name).to_vec();
             let controls = header_controls(cluster, list);
@@ -183,6 +191,10 @@ impl Workspace {
                 state.actions = row_action_states(self, cx);
                 state
             }),
+            dashboard: self
+                .dashboard
+                .as_ref()
+                .map(|(view, _)| view.read(cx).view_state()),
             dock,
             menu,
             palette: self.palette.as_ref().map(|(p, _)| p.read(cx).view_state()),
@@ -219,7 +231,7 @@ impl Workspace {
         if self.nav.read(cx).focus_handle().is_focused(window) {
             return Focus::Navigation;
         }
-        if self.settings_page.open && self.settings_page.focus.is_focused(window) {
+        if self.settings_page.open && self.settings_page.focus.contains_focused(window, cx) {
             return Focus::Settings;
         }
         if let Some((overview, _)) = &self.dashboard

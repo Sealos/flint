@@ -234,7 +234,9 @@ pub fn metric_label(metric: ThresholdMetric) -> &'static str {
 /// What the metric's number counts.
 fn metric_unit(metric: ThresholdMetric) -> &'static str {
     match metric {
-        ThresholdMetric::CpuPercent | ThresholdMetric::MemoryPercent => "% of allocatable",
+        ThresholdMetric::CpuPercent | ThresholdMetric::MemoryPercent => {
+            "% of limit, else request (nodes: allocatable)"
+        }
         ThresholdMetric::RestartsLastHour => "restarts in the last hour",
         ThresholdMetric::WarningEventsLastHour => "Warning events in the last hour",
         ThresholdMetric::PendingPodSeconds => "seconds Pending",

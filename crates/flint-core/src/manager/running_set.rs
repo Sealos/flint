@@ -44,6 +44,14 @@ const CREDENTIAL_REFUSED: &str = "the server refused this cluster's sign-in; sel
 const CONSENT_SIGN_IN_FAILED: &str =
     "this cluster's background sign-in stopped; select it to sign in";
 
+const SIGN_IN_SPENT: &str = "its sign-in needs to run again; sign in again";
+
+/// Why a member's connection made by one sign-in from the set view ended: it needed the sign-in
+/// to run again, which the click did not agree to.
+pub(super) fn sign_in_spent() -> SafeErrorText {
+    SafeErrorText::reduced(SIGN_IN_SPENT)
+}
+
 /// Why a member's connection made under consent ended.
 pub(super) fn consent_ended() -> SafeErrorText {
     SafeErrorText::reduced(CONSENT_SIGN_IN_FAILED)
@@ -382,14 +390,16 @@ impl ClusterManager {
     /// under consent is dropped either way, and the selected cluster connects again.
     pub(super) fn leave_set(&mut self, id: &str) {
         self.members.remove(id);
+        self.drop_member_sign_in(id);
         self.schedule.dequeue(&id.to_owned());
         let active = self.active.as_deref() == Some(id);
         let mut dropped = false;
         if let Some(slot) = self.cluster_mut(id) {
             let attempt = slot.member_attempt.take();
             let connecting = matches!(slot.state, ConnectionState::Connecting);
-            // Consent covers members only: a connection made under it never outlives membership.
-            let consented = slot.access.unattended()
+            // Consent covers members only: a connection made under it, or by one sign-in from the
+            // set view, never outlives membership.
+            let consented = (slot.access.unattended() || slot.access.signed_in_once_access())
                 && (connecting || matches!(slot.state, ConnectionState::Connected(_)));
             if (!active && connecting) || consented {
                 if let Some(task) = slot.connect_task.take() {
@@ -698,11 +708,17 @@ impl ClusterManager {
         self.apply_member(id, MemberEvent::ConnectionLost, now);
     }
 
-    /// The credential of `id`'s connection made under consent failed or was refused. In the
+    /// The credential of `id`'s connection made under consent, or by one sign-in from the set
+    /// view, failed, was refused or needed to run again (`reason`). In the
     /// background it waits for a sign-in, with no retry. Selected, it connects again in the
     /// foreground, where a prompt is expected. A connection still being made answers through
     /// its result.
-    pub(super) fn member_credential_failed(&mut self, id: &str, attempt: u64) {
+    pub(super) fn member_credential_failed(
+        &mut self,
+        id: &str,
+        attempt: u64,
+        reason: SafeErrorText,
+    ) {
         let now = Instant::now();
         let active = self.active.as_deref() == Some(id);
         let Some(slot) = self.cluster_mut(id) else {
@@ -711,10 +727,13 @@ impl ClusterManager {
         if slot.attempt != attempt || !matches!(slot.state, ConnectionState::Connected(_)) {
             return;
         }
+        // Only a failure under consent says anything of the background sign-in.
+        let consented = slot.access.unattended();
         if !active {
-            let reason = consent_ended();
             self.apply_member(id, MemberEvent::CredentialLost { reason }, now);
-            self.member_signed_out(id);
+            if consented {
+                self.member_signed_out(id);
+            }
             return;
         }
         self.reconnect_selected(id);

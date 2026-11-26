@@ -141,6 +141,18 @@ impl ReviewedAction {
     pub fn change(&self) -> &ResourceChange {
         &self.change
     }
+
+    /// For a restart: the pod template's `restartedAt` as reviewed (`Some(None)`: none). A copy
+    /// with another one shows a restart ran since the review.
+    pub fn restarted_at(&self) -> Option<Option<&str>> {
+        self.reviewed.restarted_at.as_ref().map(Option::as_deref)
+    }
+
+    /// For a scale: where the count reviewed was read, as the kind's definition said then. A copy
+    /// is read at these paths to tell whether the count changed since the review.
+    pub fn scale_paths(&self) -> Option<&crate::action_kinds::ScalePaths> {
+        self.reviewed.scale.as_ref()
+    }
 }
 
 /// What a reviewed resource action does.
@@ -763,8 +775,16 @@ async fn prepare(
         WriteProposal::ApplyYaml { yaml } => (yaml, false),
         WriteProposal::ApplyManifest { yaml } => (portable_manifest(&yaml)?, true),
         proposal => {
-            let change = write_actions::review(kind, live, proposal)?;
-            let reviewed = write_actions::reviewed(gate, &target.name, live, &change).await?;
+            // A scale reads its count where the definition says now, not where discovery said.
+            let scale = match proposal {
+                WriteProposal::Scale { .. } => {
+                    Some(write_actions::current_scale_paths(gate, kind).await?)
+                }
+                _ => None,
+            };
+            let change = write_actions::review(kind, live, proposal, scale.as_ref())?;
+            let reviewed =
+                write_actions::reviewed(gate, &target.name, live, &change, scale).await?;
             return Ok(WriteAction::Resource(ReviewedAction {
                 bound: target.clone(),
                 pin: gate.reviewed_pin()?,

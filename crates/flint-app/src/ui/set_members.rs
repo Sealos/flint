@@ -7,7 +7,14 @@ use flint_core::handle::{MemberReport, MemberStatus};
 use flint_core::settings::ClusterPin;
 use flint_core::{ClusterId, ClusterSummary};
 
-use super::registry::SelectCluster;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use flint_core::handle::AdmittedMember;
+use gpui_kit::{App, ClickEvent, WeakEntity, Window};
+
+use super::registry::{self, SelectCluster};
+use super::workspace::Workspace;
 
 /// Why a member's rows cannot be shown or acted on now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +64,7 @@ impl MemberCause {
             }
             Self::Moved => format!("{shown} now points at another server"),
             Self::Paused => paused_text(shown),
-            Self::SignIn => format!("{shown} needs sign-in: select it in the sidebar"),
+            Self::SignIn => format!("{shown} needs sign-in: use its Sign in"),
             Self::Failed => return None,
             Self::Disconnected => format!("{shown} was disconnected. Open the set again."),
             Self::Changed => {
@@ -164,12 +171,70 @@ pub(super) fn empty_state(members: MemberCauses) -> Option<Vec<MemberLine>> {
     lines.filter(|lines| !lines.is_empty())
 }
 
-/// The action of every "Sign in" in the set view: the chip of a signed-out member and a row of
-/// the empty-state block, each wrapped in `registry::on_click`. For now it selects the member in
-/// the sidebar, which is where a sign-in command runs; the one-shot sign-in replaces this body.
-pub(super) fn sign_in_member(cluster: &str) -> SelectCluster {
-    SelectCluster {
-        cluster: cluster.to_owned(),
+/// What one member's Sign in was drawn for: the member as the set admitted it, and the
+/// definitions its view showed then. The click sends these, so a click on a control drawn
+/// before a change is refused by the core rather than run on what changed.
+#[derive(Clone)]
+pub(super) struct SignInTarget {
+    pub(super) member: AdmittedMember,
+    pub(super) definition: Option<u64>,
+    pub(super) shown: Option<u64>,
+    /// Whether its sign-in can run from the set view. An auth provider's runs only for the
+    /// selected cluster, so its control selects it instead, as the selected member's does.
+    pub(super) in_place: bool,
+}
+
+/// What every "Sign in" in the set view runs: the chip of a signed-out member and a row of the
+/// empty-state block. The click is the consent to run that member's sign-in command once, now
+/// ([`Workspace::sign_in_set_member`]), for what the control was drawn with. Deliberately not a
+/// registered action: no command palette entry, key binding or automation `dispatch` reaches
+/// it.
+#[derive(Clone)]
+pub(super) struct MemberSignIn {
+    workspace: WeakEntity<Workspace>,
+    targets: Rc<HashMap<ClusterId, SignInTarget>>,
+}
+
+impl MemberSignIn {
+    pub(super) fn new(
+        workspace: WeakEntity<Workspace>,
+        targets: HashMap<ClusterId, SignInTarget>,
+    ) -> Self {
+        Self {
+            workspace,
+            targets: Rc::new(targets),
+        }
+    }
+
+    /// What `cluster`'s control says.
+    pub(super) fn label(&self, cluster: &str) -> &'static str {
+        match self.targets.get(cluster) {
+            Some(target) if !target.in_place => "Select to sign in",
+            _ => MemberAction::SignIn.label(),
+        }
+    }
+
+    /// The click handler of `cluster`'s Sign in. It stops the click there, so a control inside
+    /// a member's chip never also toggles the chip's filter.
+    pub(super) fn on_click(
+        &self,
+        cluster: &str,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        let workspace = self.workspace.clone();
+        let target = self.targets.get(cluster).cloned();
+        let cluster = cluster.to_owned();
+        move |event, window, cx| {
+            cx.stop_propagation();
+            match &target {
+                Some(target) if target.in_place => {
+                    let target = target.clone();
+                    let _ = workspace.update(cx, |ws, cx| ws.sign_in_set_member(target, cx));
+                }
+                _ => registry::on_click(SelectCluster {
+                    cluster: cluster.clone(),
+                })(event, window, cx),
+            }
+        }
     }
 }
 
@@ -262,7 +327,7 @@ mod tests {
             MemberCause::SignIn
                 .refusal("a")
                 .unwrap()
-                .contains("sidebar")
+                .contains("Sign in")
         );
     }
 }

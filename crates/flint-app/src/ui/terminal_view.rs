@@ -626,6 +626,7 @@ impl TerminalView {
             .when(self.is_scrolled_back(), |el| {
                 el.child(
                     Button::new("terminal-bottom")
+                        .accessibility_label("Scroll to the bottom")
                         .icon(IconName::ArrowDown)
                         .xsmall()
                         .ghost()
@@ -638,6 +639,7 @@ impl TerminalView {
             })
             .child(
                 Button::new("terminal-copy")
+                    .accessibility_label("Copy the selection")
                     .icon(IconName::Copy)
                     .xsmall()
                     .ghost()

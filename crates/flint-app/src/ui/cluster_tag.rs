@@ -248,10 +248,17 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(t.window, |_, window, cx| window.render_frame(cx))
             .unwrap();
-        assert_eq!(
-            t.label(cx, "cluster-tag-kind-alpha").as_deref(),
-            Some("Colour tag: Red")
-        );
+        // The sidebar's dot; the home screen's row draws one too.
+        let label = cx
+            .update_window(t.window, |_, window, _| {
+                window
+                    .within("cluster-list")
+                    .find("cluster-tag-kind-alpha")
+                    .label()
+                    .map(str::to_owned)
+            })
+            .unwrap();
+        assert_eq!(label.as_deref(), Some("Colour tag: Red"));
         let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
         assert!(text.contains("cluster_tags"), "{text}");
 

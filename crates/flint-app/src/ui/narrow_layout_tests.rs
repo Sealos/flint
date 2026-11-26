@@ -267,13 +267,13 @@ async fn resizing_across_the_breakpoint_keeps_focus_on_a_shown_pane(cx: &mut Tes
     assert_eq!(focus(cx, &t), Focus::List);
     assert!(!shown(cx, &t, "detail-back"), "side by side when it fits");
 
-    resize(cx, &t, 849., 600.);
+    resize(cx, &t, 949., 600.);
     assert!(!shown(cx, &t, "row-uid-web"));
     assert_eq!(focus(cx, &t), Focus::Detail);
 
     t.click(cx, "detail-back");
     draw(cx, &t);
-    resize(cx, &t, 850., 600.);
+    resize(cx, &t, 950., 600.);
     assert!(shown(cx, &t, "row-uid-web"));
     assert!(!shown(cx, &t, "detail-back"));
     assert_eq!(t.selected(cx).as_deref(), Some("web"));

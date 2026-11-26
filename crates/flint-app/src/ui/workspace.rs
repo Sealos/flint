@@ -196,8 +196,9 @@ fn layout(panes: &PaneWidths, window_width: f32, nav_shown: bool, detail_open: b
 /// The smallest window the layout works at (width, height).
 pub(in crate::ui) const MIN_WINDOW_SIZE: (f32, f32) = (760., 480.);
 
-/// The narrowest list worth showing beside the detail pane.
-const MIN_SPLIT_LIST_WIDTH: f32 = 260.;
+/// The narrowest list worth showing beside the detail pane: the same room the layout keeps for it
+/// ([`MIN_LIST_WIDTH`]), so a window that splits never squeezes the list's status columns away.
+const MIN_SPLIT_LIST_WIDTH: f32 = MIN_LIST_WIDTH;
 
 /// Whether a window this wide is too narrow for the list and the detail side by side, with every
 /// side pane at its minimum.
@@ -270,6 +271,8 @@ pub struct Workspace {
     sets: sets::ClusterSets,
     /// The Settings view and its draft, which outlives leaving it.
     settings_page: super::settings_view::SettingsPage,
+    /// The fleet home screen.
+    home: home_entry::HomePage,
     /// The window is too narrow for the list and the detail side by side, as of the last draw.
     narrow: bool,
     /// The main header shows two rows, as of the last draw: the dock leaves it more room.
@@ -388,6 +391,7 @@ impl Workspace {
             }
             NavEvent::OpenOverview => {
                 this.leave_settings_for_view();
+                this.leave_home();
                 this.open_overview(window, cx)
             }
         });
@@ -478,6 +482,7 @@ impl Workspace {
             dashboard: None,
             sets: cluster_sets,
             settings_page: super::settings_view::SettingsPage::new(cx),
+            home: Default::default(),
             narrow: false,
             two_row_header: false,
             server_moves: ServerMoves::default(),
@@ -530,6 +535,7 @@ impl Workspace {
         };
         this.show_appearance(window, cx);
         this.load_saved_sets(cx);
+        this.watch_home_feeds(cx);
         if let Some(alerts) = cx.try_global::<super::alert_center::Alerts>() {
             let center = alerts.0.clone();
             this._subscriptions
@@ -1005,6 +1011,8 @@ impl Workspace {
                         c.provisional || c.paused,
                     )
                 });
+        let kind = detail.read(cx).object().kind.clone();
+        let scalable = self.kind_scale_paths(&cluster, &kind, cx).is_some();
         let thresholds = self
             .model
             .read(cx)
@@ -1021,6 +1029,7 @@ impl Workspace {
                 Some(None) => {}
                 None => d.note_context_gone(cx),
             }
+            d.set_access_scalable(scalable, cx);
             d.set_access_connection(connection, unsettled, cx);
         });
     }
@@ -1098,6 +1107,7 @@ impl Workspace {
             &names,
             None,
             guard,
+            None,
             begin,
             |_, _| {},
             move |result, cx| {
@@ -1150,17 +1160,65 @@ impl Workspace {
         }
     }
 
+    /// Closes a confirmation whose object a copy fetched by `detail` shows changed. Every detail
+    /// pane of the window has it, a cluster set's included.
+    pub(in crate::ui) fn close_confirmations_on_change(
+        detail: &Entity<DetailView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.observe_in(detail, window, |ws, _, window, cx| {
+            ws.close_changed_confirmations(window, cx);
+        })
+    }
+
+    /// Closes, once this update is done, each confirmation whose object the detail pane shows
+    /// changed, or no longer shows.
+    pub(in crate::ui) fn close_changed_confirmations(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !gpui_kit::component::WindowExt::has_active_dialog(window, cx) {
+            return;
+        }
+        let this = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            if let Some(why) = confirm::close_changed(window, cx) {
+                let _ = this.update(cx, |ws, cx| ws.confirmation_closed(why, window, cx));
+            }
+        });
+    }
+
     /// Brings the navigation and main area in line with the model: the active cluster and its
     /// discovery.
+    /// Gives the open list the thresholds in force for its cluster, which Settings may have changed.
+    fn push_list_thresholds(&self, cx: &mut Context<Self>) {
+        let Some(list) = &self.list else {
+            return;
+        };
+        let model = self.model.read(cx);
+        let cluster = list.read(cx).cluster().to_owned();
+        let server = model
+            .clusters
+            .iter()
+            .find(|c| c.info.name == cluster)
+            .and_then(|c| c.info.server.as_deref());
+        let thresholds = model.settings.thresholds_for(&cluster, server);
+        list.update(cx, |list, cx| list.set_thresholds(thresholds, cx));
+    }
+
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if confirm::newest_is_stale(window, cx) {
             let this = cx.weak_entity();
             window.defer(cx, move |window, cx| {
                 if confirm::close_stale(window, cx) {
-                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(window, cx));
+                    let why = super::write_binding::connection_changed_text();
+                    let _ = this.update(cx, |ws, cx| ws.confirmation_closed(why, window, cx));
                 }
             });
         }
+        self.push_list_thresholds(cx);
         self.check_dock_servers(cx);
         self.tell_detail_sessions_blocked(cx);
         self.tell_shells_protected(cx);
@@ -1391,6 +1449,8 @@ impl Workspace {
             center.update(cx, |center, _| center.clear_overview());
         }
         if here {
+            // Asked for by opening the alert: in front of Home too.
+            self.leave_home();
             self.open_dashboard(window, cx);
         }
     }
@@ -1560,6 +1620,7 @@ impl Workspace {
         // The closed list's filter, if it had focus.
         release_unfocused_input(window, cx);
         self.list = Some(list);
+        self.push_list_thresholds(cx);
         let save = self.ui_state.set_last_view(&cluster, entry.id.as_str());
         self.persist(save, cx);
         let selected = Some(entry.id.clone());
@@ -1590,6 +1651,7 @@ impl Workspace {
                 self.clear_action_error(cx);
                 self.detail = None;
                 self._detail_subscriptions.clear();
+                self.close_changed_confirmations(window, cx);
                 let focus = list.read(cx).focus_handle().clone();
                 window.focus(&focus, cx);
                 // The closed pane's YAML, if it had focus.
@@ -1644,6 +1706,7 @@ impl Workspace {
                 });
                 self._detail_subscriptions =
                     vec![
+                        Self::close_confirmations_on_change(&detail, window, cx),
                         cx.subscribe_in(&detail, window, move |this, _, event, window, cx| {
                             match event {
                                 DetailEvent::Close => this.close_detail(window, cx),
@@ -1794,6 +1857,7 @@ impl Workspace {
                     model.cluster_tag(cluster),
                     keep,
                     self.can_disconnect(&cluster.info.name, cx),
+                    super::narrow_text::sidebar_subtitle_chars(widths.clusters),
                 ),
                 theme,
             ));
@@ -1845,6 +1909,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .pr(px(HANDLE_GUTTER))
             .child(pane_title("CLUSTERS", traffic_lights, theme))
+            .child(self.render_home_entry(theme, cx))
             .child(list)
             .child(self.render_sets_panel(open_members.as_ref().map(Vec::len), theme, cx))
             .child(self.render_settings_entry(theme))
@@ -1861,12 +1926,13 @@ impl Workspace {
         (is_active, ring, set_member, presence, tooltip): (bool, bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
-        (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect): (
+        (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect, subtitle_chars): (
             bool,
             &ClusterNames,
             Option<ClusterTag>,
             (KeepWatching, BackgroundSignIn),
             bool,
+            usize,
         ),
         theme: &Theme,
     ) -> AnyElement {
@@ -1973,7 +2039,12 @@ impl Workspace {
                             .line_height(px(14.))
                             .truncate()
                             .text_color(theme.muted_foreground)
-                            .child(subtitle)
+                            // Cut in the middle, so the port that tells clusters on one host
+                            // apart stays in view; the tooltip has the whole address.
+                            .child(super::narrow_text::fit_end_visible(
+                                &subtitle,
+                                subtitle_chars,
+                            ))
                             .test_support(),
                     )
                     .when_some(keep_watching::badge(keep), |col, badge| {
@@ -2245,127 +2316,95 @@ impl Workspace {
             };
             crumbs.push((object.name.clone().into(), full));
         }
-        // The object's name is a resource name: monospace, like the list's names.
-        let mono_last = self.detail.is_some();
-        let crumb_count = crumbs.len();
-        // Clipped: a cluster filling the row leaves no room for the chevrons after it.
-        let mut breadcrumb = h_flex()
-            .flex_1()
-            .min_w_0()
-            .overflow_hidden()
-            .gap_1()
-            .text_sm();
-        for (i, (text, tip)) in crumbs.into_iter().enumerate() {
-            if i > 0 {
-                breadcrumb = breadcrumb.child(
-                    Icon::new(IconName::ChevronRight)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                );
-            }
-            let last = i + 1 == crumb_count;
-            breadcrumb = breadcrumb.child(
-                div()
-                    .id(("crumb", i))
-                    .aria_label(text.clone())
-                    .test_support()
-                    .min_w_0()
-                    .truncate()
-                    // The other crumbs give way first: the cluster is cut only when it alone
-                    // is wider than the breadcrumb.
-                    .when(i == 0, |el| el.flex_none().max_w_full())
-                    .when(!last, |el| el.text_color(theme.muted_foreground))
-                    .when(last, |el| el.font_semibold())
-                    .when(last && mono_last, |el| {
-                        el.font_family(theme.mono_font_family.clone())
-                    })
-                    .child(text)
-                    .when(!tip.is_empty(), |el| {
-                        el.tooltip(move |window, cx| {
-                            cap_width(Tooltip::new(tip.clone())).build(window, cx)
-                        })
-                        .tooltip_show_delay(SHOW_DELAY)
-                    }),
-            );
-        }
-
         let detail_alone = self.main_panes(cx) == MainPanes::DetailAlone;
         let two_rows = self.header_has_two_rows(window_width, cx);
-        let namespaces = controls
-            .namespaces
-            .then(|| self.render_namespace_filter(&ns_summary, ns_label, cx));
-        let watch_mode = controls
-            .watch_mode
-            .then(|| self.render_watch_mode(&name, two_rows, cx));
+        let namespaces =
+            self.render_namespace_filter(&ns_summary, ns_label, controls.namespaces, cx);
         let keep_watching = self
-            .dashboard
-            .is_some()
-            .then(|| self.render_keep_watching(&name, None, cx));
-        let alerts = super::alert_center::render_button(cx);
-        let first_row = super::theme::moves_window(h_flex())
-            .h(px(HEADER_HEIGHT))
-            .flex_none()
-            .px_3()
-            .gap_2()
-            .when(detail_alone, |el| {
-                el.child(
-                    div().flex_none().child(
-                        Button::new("detail-back")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .label("Back")
-                            .tooltip_with_action(
-                                registry::label::<BackToList>(),
-                                &BackToList,
-                                Some(registry::WORKSPACE),
-                            )
-                            .on_click(registry::on_click(BackToList)),
-                    ),
-                )
-            })
-            .child(breadcrumb);
+            .render_keep_watching(&name, None, cx)
+            .disabled(!controls.keep_watching || self.model.read(cx).settings_error.is_some());
+        let watch_mode = self.render_watch_mode(&name, two_rows, controls.watch_mode, cx);
         let access_mode = self.render_access_mode(cluster, two_rows, theme, cx);
-        if two_rows {
-            v_flex()
-                .id("main-header")
-                .w_full()
-                .flex_none()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(first_row.w_full())
-                .child(
-                    h_flex()
-                        .id("header-controls-row")
-                        .w_full()
-                        .h(px(HEADER_HEIGHT))
-                        .flex_none()
-                        .px_3()
-                        .gap_2()
-                        .justify_end()
-                        .child(access_mode)
-                        .children(namespaces)
-                        .children(keep_watching)
-                        .children(watch_mode)
-                        .children(alerts)
-                        .test_support(),
-                )
-                .test_support()
-                .into_any_element()
-        } else {
-            first_row
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    super::theme::keeps_press(h_flex().flex_none().gap_2())
-                        .child(access_mode)
-                        .children(namespaces)
-                        .children(keep_watching)
-                        .children(watch_mode)
-                        .children(alerts),
-                )
-                .into_any_element()
+        header_shell(
+            header_breadcrumb(crumbs, self.detail.is_some(), theme),
+            detail_alone,
+            two_rows,
+            vec![
+                access_mode.into_any_element(),
+                namespaces.into_any_element(),
+                keep_watching.into_any_element(),
+                watch_mode.into_any_element(),
+            ]
+            .into_iter()
+            .chain(super::alert_center::render_button(cx).map(IntoElement::into_any_element))
+            .collect(),
+            theme,
+        )
+    }
+
+    /// The header of a running set: the set and its kind, and the same controls in the same
+    /// places as a cluster's header, off because each applies to one cluster.
+    pub(super) fn render_set_header(
+        &self,
+        label: &str,
+        kind_label: &str,
+        window_width: f32,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let mut crumbs: Vec<(SharedString, String)> = vec![
+            (label.to_owned().into(), label.to_owned()),
+            (kind_label.to_owned().into(), kind_label.to_owned()),
+        ];
+        if let Some(detail) = &self.detail {
+            let object = detail.read(cx).object();
+            crumbs.push((object.name.clone().into(), object.name.clone()));
         }
+        let two_rows = self.header_has_two_rows(window_width, cx);
+        let controls = set_header_controls();
+        let default_mode = self.model.read(cx).settings.watch_mode;
+        let per_cluster = "Applies to one cluster: select a cluster to change it.";
+        let namespaces = Button::new("namespace-filter-button")
+            .xsmall()
+            .outline()
+            .label("All namespaces")
+            .disabled(!controls.namespaces)
+            .tooltip(per_cluster);
+        let keep_watching = Button::new("keep-watching")
+            .xsmall()
+            .ghost()
+            .label(keep_watching::toggle_label(
+                KeepWatching::Off,
+                BackgroundSignIn::NotNeeded,
+            ))
+            .disabled(!controls.keep_watching)
+            .tooltip(per_cluster);
+        let watch_mode = Button::new("watch-mode")
+            .xsmall()
+            .ghost()
+            // As a cluster on the default shows it, so the slot keeps its width.
+            .label(if two_rows {
+                watch_mode_short_label(default_mode)
+            } else {
+                watch_mode_label(default_mode)
+            })
+            .disabled(!controls.watch_mode)
+            .tooltip(per_cluster);
+        header_shell(
+            header_breadcrumb(crumbs, self.detail.is_some(), theme),
+            // Back is the cluster view's: a set keeps its own panes.
+            false,
+            two_rows,
+            vec![
+                namespaces.into_any_element(),
+                keep_watching.into_any_element(),
+                watch_mode.into_any_element(),
+            ]
+            .into_iter()
+            .chain(super::alert_center::render_button(cx).map(IntoElement::into_any_element))
+            .collect(),
+            theme,
+        )
     }
 
     /// The overview's keep-watching toggle, saying what it would do and any state to act on.
@@ -2375,7 +2414,7 @@ impl Workspace {
         cluster: &str,
         member: Option<&str>,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
+    ) -> Button {
         let model = self.model.read(cx);
         let (status, sign_in) = model
             .keep_watching(cluster)
@@ -2540,6 +2579,7 @@ impl Workspace {
         &self,
         summary: &str,
         label: String,
+        enabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let this = cx.weak_entity();
@@ -2551,7 +2591,7 @@ impl Workspace {
         Popover::new("namespace-filter")
             .anchor(Anchor::TopRight)
             .track_focus(&picker)
-            .open(self.namespace_popover_open)
+            .open(self.namespace_popover_open && enabled)
             // After the change in hand: it may come while the workspace is being updated (the
             // palette dismissing it).
             .on_open_change(move |open, _, cx| {
@@ -2570,6 +2610,7 @@ impl Workspace {
                     .xsmall()
                     .outline()
                     .label(label)
+                    .disabled(!enabled)
                     // The label is cut to a few characters, so the watch mode button beside it
                     // stays on screen at the minimum width (UP-33). The accessible name and the
                     // tooltip keep the whole name.
@@ -2743,6 +2784,7 @@ impl Workspace {
         &self,
         cluster: &str,
         compact: bool,
+        enabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let settings = self.model.read(cx).settings.clone();
@@ -2760,7 +2802,7 @@ impl Workspace {
                 label
             })
             .accessibility_label(label)
-            .disabled(!settings_ok)
+            .disabled(!settings_ok || !enabled)
             .tab_stop(false)
             .tooltip(format!(
                 "{label}\nAll kinds: every kind is watched. On view: the kinds of open views and the problem kinds are watched"
@@ -2948,16 +2990,32 @@ impl Workspace {
         if let Some(settings) = self.render_settings_page(theme, cx) {
             return settings;
         }
+        if self.home.open
+            && let Some(home) = self.render_home(theme, cx)
+        {
+            return home;
+        }
         if let Some(set_view) = self.render_set_view(window_width, theme, cx) {
             return set_view;
         }
         if let Some(detail) = self.edit_shown_alone(cx) {
+            // The pane's own header belongs to the detail view, so a strip over the top edge
+            // drags the window, as with no cluster. It is drawn first: the header's buttons sit
+            // above it and take their presses before it sees them.
             return div()
                 .id("held-edit-pane")
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .relative()
+                .child(
+                    super::theme::moves_window(div())
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(HEADER_HEIGHT)),
+                )
                 .child(detail)
                 .children(self.detail_tag_strip(theme, cx))
                 .test_support()
@@ -2985,18 +3043,10 @@ impl Workspace {
             );
         }
         let Some(cluster) = model.active_cluster().cloned() else {
-            return centered(
-                v_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(div().text_lg().child("Select a cluster"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Flint connects only when you pick one in the sidebar."),
-                    ),
-            );
+            // On launch: the fleet home screen, which connects nothing.
+            return self
+                .render_home(theme, cx)
+                .unwrap_or_else(|| centered(div()));
         };
         let dashboard = self
             .dashboard
@@ -3840,20 +3890,133 @@ fn no_contexts_text(kubeconfig_env: Option<&std::ffi::OsStr>, unreadable: bool) 
     }
 }
 
+/// The header's breadcrumb: `crumbs` as text and tooltip, the last one in bold. A detail's object
+/// name is a resource name, so monospace like the list's names.
+fn header_breadcrumb(crumbs: Vec<(SharedString, String)>, mono_last: bool, theme: &Theme) -> Div {
+    let crumb_count = crumbs.len();
+    // Clipped: a cluster filling the row leaves no room for the chevrons after it.
+    let mut breadcrumb = h_flex()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .gap_1()
+        .text_sm();
+    for (i, (text, tip)) in crumbs.into_iter().enumerate() {
+        if i > 0 {
+            breadcrumb = breadcrumb.child(
+                Icon::new(IconName::ChevronRight)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            );
+        }
+        let last = i + 1 == crumb_count;
+        breadcrumb = breadcrumb.child(
+            div()
+                .id(("crumb", i))
+                .aria_label(text.clone())
+                .test_support()
+                .min_w_0()
+                .truncate()
+                // The other crumbs give way first: the first is cut only when it alone is wider
+                // than the breadcrumb.
+                .when(i == 0, |el| el.flex_none().max_w_full())
+                .when(!last, |el| el.text_color(theme.muted_foreground))
+                .when(last, |el| el.font_semibold())
+                .when(last && mono_last, |el| {
+                    el.font_family(theme.mono_font_family.clone())
+                })
+                .child(text)
+                .when(!tip.is_empty(), |el| {
+                    el.tooltip(move |window, cx| {
+                        cap_width(Tooltip::new(tip.clone())).build(window, cx)
+                    })
+                    .tooltip_show_delay(SHOW_DELAY)
+                }),
+        );
+    }
+    breadcrumb
+}
+
+/// The main header around `breadcrumb`: `controls` after it on the same row, or on a second row
+/// when the area is narrow. Every view passes its controls in the same order.
+fn header_shell(
+    breadcrumb: Div,
+    detail_alone: bool,
+    two_rows: bool,
+    controls: Vec<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
+    let first_row = super::theme::moves_window(h_flex())
+        .h(px(HEADER_HEIGHT))
+        .flex_none()
+        .px_3()
+        .gap_2()
+        .when(detail_alone, |el| {
+            el.child(
+                div().flex_none().child(
+                    Button::new("detail-back")
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::ChevronLeft)
+                        .label("Back")
+                        .tooltip_with_action(
+                            registry::label::<BackToList>(),
+                            &BackToList,
+                            Some(registry::WORKSPACE),
+                        )
+                        .on_click(registry::on_click(BackToList)),
+                ),
+            )
+        })
+        .child(breadcrumb);
+    if two_rows {
+        v_flex()
+            .id("main-header")
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(first_row.w_full())
+            .child(
+                h_flex()
+                    .id("header-controls-row")
+                    .w_full()
+                    .h(px(HEADER_HEIGHT))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
+                    .justify_end()
+                    .children(controls)
+                    .test_support(),
+            )
+            .test_support()
+            .into_any_element()
+    } else {
+        first_row
+            .border_b_1()
+            .border_color(theme.border)
+            .child(super::theme::keeps_press(h_flex().flex_none().gap_2()).children(controls))
+            .into_any_element()
+    }
+}
+
 /// Whether a main area this wide puts the detail-alone header's controls on a second row.
 fn header_needs_two_rows(main_width: f32) -> bool {
     main_width < HEADER_ONE_ROW_MIN_WIDTH
 }
 
-/// Which header controls work for the active cluster: none while its connection failed (no
-/// namespaces to pick, nothing to watch; the main area offers Retry), and the namespace
-/// filter only for a namespaced kind.
+/// Which header controls work in the view shown. The header always draws every control, so
+/// the pointer target of each stays put between views; a control that does not apply is
+/// disabled, not dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeaderControls {
     namespaces: bool,
+    keep_watching: bool,
     watch_mode: bool,
 }
 
+/// A cluster's header: none works while its connection failed (no namespaces to pick, nothing
+/// to watch; the main area offers Retry), and the namespace filter only for a namespaced kind.
 fn header_controls(
     cluster: &ClusterSummary,
     list: Option<&super::list::ResourceList>,
@@ -3861,7 +4024,17 @@ fn header_controls(
     let stopped = connection_stopped(&cluster.state);
     HeaderControls {
         namespaces: !stopped && list.is_none_or(|l| l.namespaced()),
+        keep_watching: !stopped,
         watch_mode: !stopped,
+    }
+}
+
+/// A set's header: each control is a cluster's own setting, so none applies to the set.
+fn set_header_controls() -> HeaderControls {
+    HeaderControls {
+        namespaces: false,
+        keep_watching: false,
+        watch_mode: false,
     }
 }
 
@@ -3967,9 +4140,11 @@ impl Render for Workspace {
         self.sync_namespace_picker_with_dialog(window, cx);
         self.close_finished_held_edit(window, cx);
         self.settings_follow_main();
+        self.home_follow_main(cx);
         self.flush_threshold_entry(cx);
         self.follow_threshold_rows(cx);
         self.close_orphaned_threshold_entry(window, cx);
+        self.sync_settings_fields(window, cx);
         let window_width = f32::from(window.viewport_size().width);
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
@@ -3977,7 +4152,8 @@ impl Render for Workspace {
         self.sync_menus(cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
-        let has_cluster = self.model.read(cx).active_cluster().is_some();
+        // With Home shown there is no header either.
+        let has_cluster = self.model.read(cx).active_cluster().is_some() && !self.home_shown(cx);
         let strip_shown = window_strip_shown(
             has_cluster,
             self.settings_page.open,
@@ -4009,6 +4185,7 @@ impl Render for Workspace {
             .capture_action(cx.listener(|this, _: &OpenObject, _, _| {
                 this.list_in_front = false;
                 this.leave_settings_for_view();
+                this.leave_home();
             }))
             .capture_action(cx.listener(|this, _: &EditYaml, _, _| this.list_in_front = false))
             .capture_action(cx.listener(|this, _: &FocusFilter, _, _| this.list_in_front = true))
@@ -4181,6 +4358,13 @@ mod disconnect;
 #[path = "workspace_forwards.rs"]
 mod forwards;
 
+#[path = "workspace_home.rs"]
+mod home_entry;
+
+#[cfg(test)]
+#[path = "workspace_home_tests.rs"]
+mod home_tests;
+
 #[path = "workspace_keys.rs"]
 mod keys;
 
@@ -4188,7 +4372,10 @@ mod keys;
 pub(in crate::ui) mod problems;
 
 #[path = "workspace_settings.rs"]
-mod settings_entry;
+pub(in crate::ui) mod settings_entry;
+
+#[path = "workspace_settings_logs_paths.rs"]
+mod settings_logs_paths;
 
 #[path = "workspace_sets.rs"]
 mod sets;
@@ -4448,6 +4635,30 @@ mod tests {
         // No active cluster: navigation is hidden and takes no room from the sidebar.
         let welcome = layout(&saved, 650., false, false);
         assert_eq!((welcome.clusters, welcome.navigation), (200., 0.));
+    }
+
+    // covers #780: a window that splits always leaves the list its minimum room, with the detail
+    // pane open at any width; a narrower one shows the detail alone.
+    #[test]
+    fn a_split_window_always_leaves_the_list_its_minimum() {
+        let saved = PaneWidths::default();
+        for width in (760..=1700).step_by(10) {
+            let width = width as f32;
+            if super::too_narrow_for_split(width) {
+                continue;
+            }
+            let split = layout(&saved, width, true, true);
+            assert!(
+                list_width(split, width) >= MIN_LIST_WIDTH - 0.01,
+                "{width}: {split:?}"
+            );
+        }
+        // The smallest window that splits sits just where the minimum panes leave the list 360.
+        assert!(super::too_narrow_for_split(949.));
+        assert!(!super::too_narrow_for_split(950.));
+        // With the detail closed, the list has the rest of any window.
+        let closed = layout(&saved, 800., true, false);
+        assert_eq!(list_width(closed, 800.), 800. - 200. - 220.);
     }
 
     // covers UP-55: whatever a context is called, these dialogs show one Context and one Server.

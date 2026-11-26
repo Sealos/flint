@@ -52,6 +52,10 @@ use super::list::combined::{
     ToggleCombinedProblems, ToggleCombinedWide, ToggleGroupByCluster,
 };
 pub use super::pending_threshold::SetPendingThreshold;
+pub use super::settings_logs_paths::{
+    AddKubeconfigPath, ChooseKubeconfigPaths, EditHelmPath, EditLogBufferLines, EditLogBufferMib,
+    EditLogTotalMib, EditPathOverride, EditProtectLocalClusters, RemoveKubeconfigPath,
+};
 pub use super::settings_thresholds::{
     AddClusterOverride, CancelThresholdEntry, EditClusterAlerts, EditClusterWatchMode,
     EditThreshold, ResetClusterOverrides, TypeThreshold,
@@ -95,7 +99,9 @@ actions!(
     workspace,
     [
         /// Open the active cluster's overview.
-        OpenClusterOverview
+        OpenClusterOverview,
+        /// Show the fleet home screen. The active cluster stays connected.
+        OpenHome
     ]
 );
 actions!(
@@ -147,6 +153,8 @@ actions!(
         DefaultWatchOpenViewsOnly,
         /// Go back to the kind and object shown before.
         GoBack,
+        /// Go forward to the kind and object Go Back left.
+        GoForward,
         /// In a narrow window, return from the detail to the list, keeping the selection.
         BackToList,
         /// Move focus to the next pane: clusters, navigation, list, detail, dock.
@@ -778,8 +786,8 @@ pub struct SelectRow {
     pub name: String,
 }
 
-/// Sort by a column, as clicking its header does: ascending, descending, then unsorted. The
-/// choice is remembered for the cluster and kind.
+/// Cycle a column's sort as clicking its header does. The choice is remembered for the
+/// cluster and kind.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
 #[action(namespace = resource_list, no_json)]
 #[serde(deny_unknown_fields)]
@@ -792,6 +800,18 @@ pub struct SortBy {
     #[serde(default)]
     pub key: Option<String>,
 }
+
+/// Set a column's sort to ascending.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = resource_list, no_json)]
+#[serde(transparent)]
+pub struct SortByAscending(pub SortBy);
+
+/// Set a column's sort to descending.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
+#[action(namespace = resource_list, no_json)]
+#[serde(transparent)]
+pub struct SortByDescending(pub SortBy);
 
 /// Reveal or hide one value of a Secret, by key.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Action)]
@@ -1534,6 +1554,18 @@ pub fn on_click_in<E: ?Sized, A: Action>(
     }
 }
 
+/// [`on_click_in`] for an action chosen at draw time.
+pub fn on_click_dyn_in<E: ?Sized>(
+    focus: FocusHandle,
+    action: Box<dyn Action>,
+) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if let Err(e) = dispatch_in(&focus, action.as_ref(), window, cx) {
+            report_refusal(&e, cx);
+        }
+    }
+}
+
 /// [`on_click`] that also hands a refusal to `refused`, for a control drawn from state that may
 /// be older than the click (a menu left open), so the user learns why nothing happened.
 pub fn on_click_or<E: ?Sized>(
@@ -2110,6 +2142,25 @@ const EDIT_APPEARANCE: &[Arg] = &[arg(
     ArgKind::Choice(&["system", "light", "dark"]),
 )];
 const EDIT_NOTIFICATIONS: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
+const EDIT_LOG_LINES: &[Arg] = &[arg("lines", "from 1000 to 1000000", ArgKind::Number)];
+const EDIT_LOG_MIB: &[Arg] = &[arg("mib", "from 8 to 1024", ArgKind::Number)];
+const EDIT_LOG_TOTAL: &[Arg] = &[arg("mib", "from 64 to 16384", ArgKind::Number)];
+const EDIT_PATH: &[Arg] = &[arg(
+    "path",
+    "absolute folders separated by colons; empty uses the login shell's",
+    ArgKind::Text,
+)];
+const EDIT_HELM: &[Arg] = &[arg(
+    "path",
+    "the helm binary, absolute or under ~; empty finds it on PATH",
+    ArgKind::Text,
+)];
+const KUBECONFIG_PATH: &[Arg] = &[arg(
+    "path",
+    "a kubeconfig file, absolute or under ~",
+    ArgKind::Text,
+)];
+const EDIT_PROTECT_LOCAL: &[Arg] = &[arg("enabled", "true or false", ArgKind::Bool)];
 const EDIT_WATCH_MODE: &[Arg] = &[arg(
     "mode",
     "all or on_view",
@@ -2437,6 +2488,60 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
             EDIT_WATCH_MODE,
         )
         .of(C::Flint, S::Settings),
+        Spec::with_args::<EditLogBufferLines>(
+            "Edit Log Lines Per Tab…",
+            "Set the lines each log tab keeps in the Settings draft.",
+            EDIT_LOG_LINES,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditLogBufferMib>(
+            "Edit Log Memory Per Tab…",
+            "Set the MiB each log tab keeps in the Settings draft.",
+            EDIT_LOG_MIB,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditLogTotalMib>(
+            "Edit Total Log Memory…",
+            "Set the MiB all log tabs keep together in the Settings draft.",
+            EDIT_LOG_TOTAL,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::unit::<ChooseKubeconfigPaths>(
+            "Choose Kubeconfig Files",
+            "Choose kubeconfig files to add to the list in the Settings draft.",
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<AddKubeconfigPath>(
+            "Add Kubeconfig Path…",
+            "Add a kubeconfig file to the list in the Settings draft.",
+            KUBECONFIG_PATH,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<RemoveKubeconfigPath>(
+            "Remove Kubeconfig Path…",
+            "Drop a kubeconfig file from the list in the Settings draft.",
+            KUBECONFIG_PATH,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditPathOverride>(
+            "Edit PATH…",
+            "Set the PATH override in the Settings draft.",
+            EDIT_PATH,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditHelmPath>(
+            "Edit Helm Path…",
+            "Set the helm binary in the Settings draft.",
+            EDIT_HELM,
+        )
+        .of(C::Flint, S::Settings),
+        Spec::with_args::<EditProtectLocalClusters>(
+            "Edit Local Cluster Protection…",
+            "Turn protection of local clusters on or off in the Settings draft. Turning it off \
+             is confirmed at Save.",
+            EDIT_PROTECT_LOCAL,
+        )
+        .of(C::Flint, S::Settings),
         Spec::with_args::<EditThreshold>(
             "Edit Threshold…",
             "Set a warning threshold, global or for one cluster, in the Settings draft.",
@@ -2598,6 +2703,11 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .of(C::Flint, S::Dialog)
         .hidden(),
         // Clusters.
+        Spec::unit::<OpenHome>(
+            "Go Home",
+            "Show every cluster at a glance: the health of those kept watching, and the rest. The active cluster stays connected.",
+        )
+        .of(C::Cluster, S::Workspace),
         Spec::with_args::<SelectCluster>(
             "Select Cluster…",
             "Make a cluster the active one and connect to it.",
@@ -2893,6 +3003,9 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         Spec::unit::<GoBack>("Go Back", "Go back to the kind and object shown before.")
             .of(C::View, S::Workspace)
             .keys(&["secondary-["], Some(WORKSPACE)),
+        Spec::unit::<GoForward>("Go Forward", "Go forward to the kind and object Go Back left.")
+            .of(C::View, S::Workspace)
+            .keys(&["secondary-]"], Some(WORKSPACE)),
         Spec::unit::<BackToList>(
             "Back to List",
             "In a narrow window, return from the detail to the list, keeping the selection.",
@@ -3024,7 +3137,19 @@ static REGISTRY: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
         .hidden(),
         Spec::with_args::<SortBy>(
             "Sort by Column…",
-            "Sort by a column: ascending, descending, then unsorted.",
+            "Cycle a column's sort. Numeric columns start descending and other columns start ascending.",
+            COLUMN,
+        )
+        .of(C::List, S::List),
+        Spec::with_args::<SortByAscending>(
+            "Sort by Column, Ascending…",
+            "Sort the chosen column in ascending order.",
+            COLUMN,
+        )
+        .of(C::List, S::List),
+        Spec::with_args::<SortByDescending>(
+            "Sort by Column, Descending…",
+            "Sort the chosen column in descending order.",
             COLUMN,
         )
         .of(C::List, S::List),
@@ -3925,6 +4050,8 @@ pub mod tests {
         // Reachable only from the palette (#29): no key, no menu item, no control.
         for name in [
             "resource_list::SortBy",
+            "resource_list::SortByAscending",
+            "resource_list::SortByDescending",
             "workspace::SelectCluster",
             "workspace::OpenView",
             "logs::OpenSelectorLogs",

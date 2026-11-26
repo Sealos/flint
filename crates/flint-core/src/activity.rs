@@ -250,6 +250,21 @@ impl ServerKeys {
         }
     }
 
+    /// The keys of the log in `config_dir` without making its [`KEY_FILE`]: none when it is
+    /// missing, unreadable or malformed. For readers of the log, so a key moved aside for a
+    /// restore is not replaced by a new one that no record was written with.
+    pub fn read(config_dir: &Path) -> Self {
+        match read_key(&config_dir.join(KEY_FILE)) {
+            Ok(secret) => ServerKeys::with_secret(&secret),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(error = %e, "cannot read the agent activity log's key");
+                }
+                ServerKeys { key: None }
+            }
+        }
+    }
+
     /// Keys under `secret` (tests, and [`ServerKeys::open`]).
     pub fn with_secret(secret: &[u8]) -> Self {
         ServerKeys {
@@ -1284,6 +1299,19 @@ mod tests {
 
     // covers UP-16: without a usable key file a call is still recorded, without a server key;
     // its tab then finds it by context alone.
+    // covers UP-16: the app's reads never make a key, so one moved aside for a restore can be
+    // put back, and records stay unverified meanwhile.
+    #[test]
+    fn reading_the_keys_never_makes_a_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = ServerKeys::read(dir.path());
+        assert_eq!(keys.expected(Some("https://a")), ExpectedServer::Unknown);
+        assert!(!dir.path().join(KEY_FILE).exists());
+        let made = ServerKeys::open(dir.path()).server_key("https://a");
+        assert!(made.is_some());
+        assert_eq!(ServerKeys::read(dir.path()).server_key("https://a"), made);
+    }
+
     #[test]
     fn without_a_key_file_records_have_no_server_key() {
         let dir = tempfile::tempdir().unwrap();

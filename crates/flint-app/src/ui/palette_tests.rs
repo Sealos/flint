@@ -183,6 +183,10 @@ async fn lists_available_actions_with_categories_and_shortcuts(cx: &mut TestAppC
         "no cluster is active: {all:?}"
     );
     assert!(!all.contains(&"Focus Filter"), "no list is open: {all:?}");
+    assert!(
+        !all.iter().any(|l| l.starts_with("Sort by Column")),
+        "{all:?}"
+    );
     assert!(!all.contains(&"Show Command Palette"), "{all:?}");
     assert!(!all.contains(&"Close Command Palette"), "{all:?}");
     // The Edit actions are listed only where they act: a text field, or a shell tab. (Copy is
@@ -212,6 +216,8 @@ async fn lists_available_actions_with_categories_and_shortcuts(cx: &mut TestAppC
     let all = labels(&palette);
     assert!(all.contains(&"Open Kind…"), "{all:?}");
     assert!(all.contains(&"Sort by Column…"), "{all:?}");
+    assert!(all.contains(&"Sort by Column, Ascending…"), "{all:?}");
+    assert!(all.contains(&"Sort by Column, Descending…"), "{all:?}");
     assert!(all.contains(&"Copy"), "{all:?}");
     assert!(all.contains(&"Select All"), "{all:?}");
     assert!(!all.contains(&"Close Detail"), "no detail is open: {all:?}");
@@ -311,6 +317,57 @@ async fn actions_with_arguments_ask_for_them(cx: &mut TestAppContext) {
         .unwrap()
         .expect("sorted");
     assert_eq!(sort.column, "Restarts");
+    assert!(sort.descending);
+}
+
+#[gpui_kit::test]
+async fn palette_sets_the_requested_sort_direction(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0), ("demo", "web", 3)])
+        .await;
+    let list = t.list(cx).unwrap();
+
+    for (query, label, descending, names) in [
+        (
+            "sort asc",
+            "Sort by Column, Ascending…",
+            false,
+            ["api", "web"],
+        ),
+        (
+            "sort desc",
+            "Sort by Column, Descending…",
+            true,
+            ["web", "api"],
+        ),
+        (
+            "sort desc",
+            "Sort by Column, Descending…",
+            true,
+            ["web", "api"],
+        ),
+    ] {
+        open_palette(cx, &t).await;
+        t.type_text(cx, query);
+        assert_eq!(selected(&shown(cx, &t)), label);
+        t.press(cx, "enter");
+        let palette = shown(cx, &t);
+        assert_eq!(palette.argument.as_deref(), Some("column"));
+        assert_eq!(labels(&palette), ["Name", "Namespace", "Restarts"]);
+        t.type_text(cx, "rest");
+        t.press(cx, "enter");
+        assert!(palette_closed(cx, &t));
+        let list = list.clone();
+        cx.wait_for(t.window, WAIT, move |_, cx| {
+            let shown = list.read(cx).view_state();
+            shown
+                .sort
+                .is_some_and(|sort| sort.column == "Restarts" && sort.descending == descending)
+                && shown.rows.iter().map(|r| r.name.as_str()).eq(names)
+        })
+        .await;
+    }
 }
 
 // covers UP-45 (#29): Open Logs by Label Selector… asks for a namespace (one may be typed that
@@ -601,6 +658,7 @@ async fn the_menus_hold_the_standard_items(cx: &mut TestAppContext) {
             "Show Command Palette",
             "Go to Resource",
             "Go Back",
+            "Go Forward",
             "Appearance"
         ]
     );
@@ -1594,4 +1652,50 @@ async fn a_popover_without_focus_closes_when_the_palette_opens(cx: &mut TestAppC
     t.press(cx, "escape");
     t.click(cx, "namespace-filter-button");
     t.wait_for_element(cx, "ns-all").await;
+}
+
+// covers #313: the palette's and the switcher's keys and menu items do nothing while a dialog
+// is open: neither opens behind it, and the dialog stays.
+#[gpui_kit::test]
+async fn palette_and_switcher_keys_and_menu_items_leave_a_dialog_alone(cx: &mut TestAppContext) {
+    use crate::ui::registry::{ToggleCommandPalette, ToggleResourceSwitcher};
+
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_workspace(cx, dir.path()).await;
+    t.open_pods(cx, &[("demo", "api", 0)]).await;
+    t.dispatch(cx, "flint::About", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |window, cx| window.has_active_dialog(cx))
+        .await;
+    // The keys.
+    t.press_key_of(cx, "palette::ToggleCommandPalette");
+    assert!(
+        palette_closed(cx, &t),
+        "the palette opened behind the dialog"
+    );
+    t.press_key_of(cx, "palette::ToggleResourceSwitcher");
+    assert!(
+        palette_closed(cx, &t),
+        "the switcher opened behind the dialog"
+    );
+    // The menu items: dispatched as a click on them does.
+    cx.update_window(t.window, |_, window, cx| {
+        window.dispatch_action(Box::new(ToggleCommandPalette), cx);
+        window.dispatch_action(Box::new(ToggleResourceSwitcher), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        palette_closed(cx, &t),
+        "a menu item opened behind the dialog"
+    );
+    let still_open = cx
+        .update_window(t.window, |_, window, cx| window.has_active_dialog(cx))
+        .unwrap();
+    assert!(still_open, "the dialog stayed open");
+    t.dispatch(cx, "ui::Confirm", Value::Null).unwrap();
+    cx.wait_for(t.window, WAIT, |window, cx| !window.has_active_dialog(cx))
+        .await;
+    // Without the dialog the same key opens the switcher again.
+    t.press_key_of(cx, "palette::ToggleResourceSwitcher");
+    assert!(palette(cx, &t).is_some());
 }
