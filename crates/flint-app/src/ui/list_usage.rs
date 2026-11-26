@@ -15,6 +15,7 @@ use flint_core::thresholds::{ThresholdMetric, Thresholds};
 use flint_core::{Column, ColumnRole, ColumnType, KindId, MetricsError, Row};
 
 use super::list_usage_bar::{self, Bar, NODE_LABELS, POD_LABELS, Scale};
+use super::list_usage_workloads::{self, OwnerChain};
 
 /// What a cell or detail line says for a value the poll did not report.
 pub(in crate::ui) const UNKNOWN_TEXT: &str = "unknown";
@@ -50,17 +51,34 @@ pub(in crate::ui) fn memory_text(memory: Memory) -> String {
 pub(in crate::ui) enum UsageSubject {
     Pods,
     Nodes,
+    /// A workload kind: its use is the total over its current pods.
+    Workloads(OwnerChain),
 }
 
 impl UsageSubject {
+    /// The kinds whose detail pane shows usage: only pods and nodes so far.
+    pub(in crate::ui) fn of_detail(kind: &KindId) -> Option<Self> {
+        Self::of(kind).filter(|subject| !matches!(subject, Self::Workloads(_)))
+    }
+
     pub(in crate::ui) fn of(kind: &KindId) -> Option<Self> {
         if *kind == KindId::pods() {
-            Some(Self::Pods)
-        } else if *kind == KindId::new("", "nodes") {
-            Some(Self::Nodes)
-        } else {
-            None
+            return Some(Self::Pods);
         }
+        if *kind == KindId::new("", "nodes") {
+            return Some(Self::Nodes);
+        }
+        // A ReplicaSet's, Job's, StatefulSet's or DaemonSet's pods name it as their controller. A
+        // Deployment's and a CronJob's are found through the ReplicaSets and Jobs they control.
+        let chain = match (kind.group(), kind.plural()) {
+            ("apps", "replicasets" | "statefulsets" | "daemonsets") | ("batch", "jobs") => {
+                OwnerChain::Direct
+            }
+            ("apps", "deployments") => OwnerChain::ViaReplicaSets,
+            ("batch", "cronjobs") => OwnerChain::ViaJobs,
+            _ => return None,
+        };
+        Some(Self::Workloads(chain))
     }
 }
 
@@ -80,6 +98,8 @@ pub(in crate::ui) enum UsageSource {
     Pods(Arc<BTreeMap<PodKey, PodSample>>, Option<PodIndex>),
     /// Nodes' use, and what each offers and its pods request while the feed can say.
     Nodes(Arc<BTreeMap<String, Usage>>, Option<ClusterCapacity>),
+    /// Pods' use, and which pod belongs to which workload.
+    Workloads(Arc<BTreeMap<PodKey, PodSample>>, PodIndex, OwnerChain),
 }
 
 impl UsageSource {
@@ -94,6 +114,15 @@ impl UsageSource {
                 let index = telemetry.snapshot.pods.clone();
                 Self::from_read(&telemetry.reads.pod_usage, current, |usage| {
                     Self::Pods(usage, index)
+                })
+            }
+            UsageSubject::Workloads(chain) => {
+                let index = telemetry.snapshot.pods.clone();
+                Self::from_read(&telemetry.reads.pod_usage, current, |usage| match index {
+                    Some(index) if chain.is_known(&index) => Self::Workloads(usage, index, chain),
+                    // Without the pods, or the ReplicaSets or Jobs that say whose they are, a
+                    // workload with no pod found is not a workload with none.
+                    _ => Self::Unknown,
                 })
             }
             UsageSubject::Nodes => {
@@ -125,7 +154,7 @@ impl UsageSource {
     }
 
     fn has_readings(&self) -> bool {
-        matches!(self, Self::Pods(..) | Self::Nodes(..))
+        matches!(self, Self::Pods(..) | Self::Nodes(..) | Self::Workloads(..))
     }
 
     /// Why the columns are missing, when that needs saying.
@@ -133,7 +162,11 @@ impl UsageSource {
         match self {
             Self::NoFeed => Some(NO_FEED_HINT),
             Self::NotInstalled => Some(NOT_INSTALLED_HINT),
-            Self::Hidden | Self::Unknown | Self::Pods(..) | Self::Nodes(..) => None,
+            Self::Hidden
+            | Self::Unknown
+            | Self::Pods(..)
+            | Self::Nodes(..)
+            | Self::Workloads(..) => None,
         }
     }
 
@@ -170,6 +203,24 @@ impl UsageSource {
                 }),
                 true,
             ),
+            Self::Workloads(usage, index, chain) => {
+                let totals = list_usage_workloads::totals_by_owner(index, usage, *chain);
+                UsageValues::collect(
+                    rows.iter().map(|row| match totals.get(&*row.uid) {
+                        // No pod is running or reporting: nothing to show, which is not unknown.
+                        None => RowUsage::idle(),
+                        Some(totals) if !totals.budgeted => {
+                            RowUsage::budget_unknown(totals.usage())
+                        }
+                        Some(totals) => RowUsage::measured(
+                            totals.usage(),
+                            Scale::new(totals.cpu.request, totals.cpu.limit),
+                            Scale::new(totals.memory.request, totals.memory.limit),
+                        ),
+                    }),
+                    false,
+                )
+            }
             Self::Pods(usage, index) => {
                 let mut key = PodKey::default();
                 UsageValues::collect(
@@ -219,6 +270,8 @@ enum Reading {
     /// The poll did not report the row. Its amounts are meaningless.
     #[default]
     Unknown,
+    /// A workload with no pod that is running and reporting: no value, and not a failed reading.
+    Idle,
     /// Reported, and compared with what the row's scales say.
     Measured,
     /// Reported, but what to compare it with is not known: the feed has no record of the pod, or
@@ -242,6 +295,13 @@ impl RowUsage {
             usage: Usage::default(),
             cpu: Scale::default(),
             memory: Scale::default(),
+        }
+    }
+
+    fn idle() -> Self {
+        Self {
+            reading: Reading::Idle,
+            ..Self::unknown()
         }
     }
 
@@ -325,6 +385,7 @@ impl UsageValues {
         let (values, _) = self.of_role(role)?;
         Some(match self.known_value(values, row) {
             Some(value) => display(role, value),
+            None if self.known.get(row) == Some(&Reading::Idle) => String::new(),
             None => UNKNOWN_TEXT.to_owned(),
         })
     }
@@ -858,17 +919,93 @@ mod tests {
     }
 
     #[test]
-    fn only_pods_and_nodes_have_usage() {
+    fn pods_nodes_and_workloads_have_usage() {
         assert_eq!(UsageSubject::of(&KindId::pods()), Some(UsageSubject::Pods));
         assert_eq!(
             UsageSubject::of(&KindId::new("", "nodes")),
             Some(UsageSubject::Nodes)
         );
-        assert_eq!(UsageSubject::of(&KindId::new("apps", "deployments")), None);
+        let workload = |group: &str, plural: &str| UsageSubject::of(&KindId::new(group, plural));
+        for (group, plural) in [
+            ("apps", "replicasets"),
+            ("apps", "statefulsets"),
+            ("apps", "daemonsets"),
+            ("batch", "jobs"),
+        ] {
+            assert_eq!(
+                workload(group, plural),
+                Some(UsageSubject::Workloads(OwnerChain::Direct))
+            );
+        }
         assert_eq!(
-            UsageSubject::of(&KindId::new("metrics.k8s.io", "pods")),
+            workload("apps", "deployments"),
+            Some(UsageSubject::Workloads(OwnerChain::ViaReplicaSets))
+        );
+        assert_eq!(
+            workload("batch", "cronjobs"),
+            Some(UsageSubject::Workloads(OwnerChain::ViaJobs))
+        );
+        // Their panes show no usage yet.
+        assert_eq!(
+            UsageSubject::of_detail(&KindId::new("apps", "deployments")),
             None
         );
+        assert_eq!(
+            UsageSubject::of_detail(&KindId::pods()),
+            Some(UsageSubject::Pods)
+        );
+        assert_eq!(workload("", "services"), None);
+        assert_eq!(workload("metrics.k8s.io", "pods"), None);
+    }
+
+    #[test]
+    fn a_workload_with_no_reporting_pod_shows_no_value_and_sorts_after_the_others() {
+        use flint_core::telemetry::{Controllers, PodOwner, PodRecord};
+        let owner = PodOwner {
+            group: "apps".into(),
+            kind: "StatefulSet".into(),
+            name: "db".into(),
+            uid: "sts".into(),
+        };
+        let spec = serde_json::from_value(serde_json::json!({"containers": [{
+            "name": "app",
+            "resources": {"requests": {"cpu": "10m"}, "limits": {"cpu": "20m"}}
+        }]}))
+        .unwrap();
+        let record = PodRecord {
+            namespace: "a".into(),
+            name: "web".into(),
+            created: Some(SAMPLED_AT - WINDOW_SECS),
+            budget: flint_core::metrics::PodBudgetCheck::of(&spec),
+            node: None,
+            owner: Some(owner),
+            finished: false,
+        };
+        let index = PodIndex::for_tests([("web", record)], Controllers::new());
+        let key = ("a".to_owned(), "web".to_owned());
+        let source = UsageSource::Workloads(
+            Arc::new([(key, sample(10, 10))].into_iter().collect()),
+            index,
+            OwnerChain::ViaReplicaSets,
+        );
+        let uid_row = |uid: &str| {
+            let mut row = row(Some("a"), uid);
+            Arc::get_mut(&mut row).unwrap().uid = uid.into();
+            row
+        };
+        let rows = [uid_row("empty"), uid_row("sts")];
+        let values = source.values(&rows);
+        assert_eq!(values.text(ColumnRole::CpuUsage, 0).unwrap(), "");
+        assert_eq!(values.text(ColumnRole::CpuUsage, 1).unwrap(), "10m");
+        let thresholds = Thresholds::default();
+        assert_eq!(values.bar(ColumnRole::CpuUsage, 0, &thresholds), None);
+        let bar = values.bar(ColumnRole::CpuUsage, 1, &thresholds).unwrap();
+        assert_eq!((bar.fill, bar.tick), (0.5, Some(0.5)));
+        let order = [0, 1];
+        let up = values.sorted(&order, ColumnRole::CpuUsage, false).unwrap();
+        assert_eq!(&*up, &[1, 0]);
+        let down = values.sorted(&order, ColumnRole::CpuUsage, true).unwrap();
+        assert_eq!(&*down, &[1, 0]);
     }
 
     #[test]

@@ -302,7 +302,7 @@ impl DetailView {
             subject,
         );
         let cluster_label = flint_core::display::single_line(&object.cluster);
-        let follow_usage = match UsageSubject::of(&object.kind) {
+        let follow_usage = match UsageSubject::of_detail(&object.kind) {
             Some(subject) => {
                 let (core, cluster) = (core.clone(), object.cluster.clone());
                 let mut updates = core.telemetry_updates();
@@ -678,7 +678,7 @@ impl DetailView {
         // A re-render of the previous copy must not land after this one.
         self._yaml = Task::ready(());
         self.usage
-            .set_object(UsageSubject::of(&self.object.kind), &detail.object);
+            .set_object(UsageSubject::of_detail(&self.object.kind), &detail.object);
         self.fetch = Fetch::Loaded { detail, overview };
         self.run_pending(cx);
         if self.show_managed_fields == managed {
