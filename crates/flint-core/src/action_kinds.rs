@@ -85,14 +85,19 @@ fn count_at(object: &Value, pointer: &str) -> Option<u32> {
 /// `.spec.a.b` as `/spec/a/b`, if it is a plain field path whose first field is `root`. A field
 /// name is taken literally, with `~` and `/` escaped for the pointer; array indexes, quoting,
 /// wildcards and filters are not plain. Nor is a field a JSON Pointer could take for an array
-/// index (`0`, `-`): Kubernetes reads every field as an object key, and a pointer through an
-/// array would read and write another field than the one it names.
+/// index (`0`, `-1`, `+1`, `-`): Kubernetes reads every field as an object key, and a pointer
+/// through an array would read and write another field than the one it names.
 fn pointer(path: &str, root: &str) -> Option<String> {
     let fields: Vec<&str> = path.strip_prefix('.')?.split('.').collect();
     let plain = |field: &&str| {
         !field.is_empty()
             && *field != "-"
-            && !field.chars().all(|c| c.is_ascii_digit())
+            // Signed too: Kubernetes' JSON Patch reads `-1` and `+1` as array indexes.
+            && !field
+                .strip_prefix(['+', '-'])
+                .unwrap_or(field)
+                .chars()
+                .all(|c| c.is_ascii_digit())
             && !field
                 .chars()
                 .any(|c| c.is_whitespace() || c.is_control() || "[]'\"*@$()?,:\\{}".contains(c))
@@ -332,6 +337,9 @@ mod tests {
             // A pointer would take these for array indexes.
             (".spec.pools.0.size", ".status.n"),
             (".spec.pools.-.size", ".status.n"),
+            (".spec.pools.-1.size", ".status.n"),
+            (".spec.pools.+1.size", ".status.n"),
+            (".spec.size", ".status.-0"),
             (".spec.size", ".status.0"),
             (".spec.size", ".spec.n"),
             (".spec.size", ""),

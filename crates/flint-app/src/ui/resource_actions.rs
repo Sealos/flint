@@ -703,10 +703,15 @@ impl ReviewedObject {
     /// Why `detail` says the object changed since the review, if it does. A pane that no longer
     /// shows the object says so too.
     fn changed(&self, detail: Option<&DetailView>) -> Option<String> {
-        if !self.watched {
-            return None;
-        }
         let changed = || Some(object_changed_text(&self.name));
+        // A pane still on another copy cannot say what changed, but it still says whether the
+        // row is selected.
+        if !self.watched {
+            return match detail {
+                Some(detail) if shown_key(detail) == self.key => None,
+                _ => changed(),
+            };
+        }
         let Some(detail) = detail else {
             return changed();
         };
