@@ -38,21 +38,30 @@ pub fn exit_code(pid: u32) -> Result<Option<i32>> {
     Ok((ended != 0).then_some(status))
 }
 
-/// The paths the connected cluster's feed lists on a timer, whatever view is open: the metrics
-/// behind the usage columns and trends, Warning events and claims.
-const FEED_POLLS: [&str; 4] = [
-    "/apis/metrics.k8s.io/v1beta1/nodes",
-    "/apis/metrics.k8s.io/v1beta1/pods",
-    "/api/v1/events",
-    "/api/v1/persistentvolumeclaims",
+/// What the connected cluster's feed lists on a timer, whatever view is open: the metrics behind
+/// the usage columns and trends, claims, and Warning events. Each a path, and the one field
+/// selector it carries, if any.
+const FEED_POLLS: [(&str, Option<&str>); 4] = [
+    ("/apis/metrics.k8s.io/v1beta1/nodes", None),
+    ("/apis/metrics.k8s.io/v1beta1/pods", None),
+    ("/api/v1/persistentvolumeclaims", None),
+    ("/api/v1/events", Some("fieldSelector=type%3DWarning")),
 ];
 
 /// Whether `request` is one of the feed's timed list GETs, which run on the read client while the
 /// cluster is connected. A check that an action or a search sent nothing leaves only these out.
+/// A list with another selector, such as one object's events, is not one of them.
 pub fn is_feed_poll(request: &RequestRecord) -> bool {
+    let param = |name: &str| {
+        let prefix = format!("{name}=");
+        request.query.split('&').find(|p| p.starts_with(&prefix))
+    };
     request.method == http::Method::GET
         && request.verb == Verb::List
-        && FEED_POLLS.contains(&request.path.as_str())
+        && param("labelSelector").is_none()
+        && FEED_POLLS
+            .iter()
+            .any(|&(path, fields)| request.path == path && param("fieldSelector") == fields)
 }
 
 /// Selects `cluster` and waits until it is connected and its kinds are discovered.
