@@ -18,8 +18,9 @@ use flint_core::combined::CombinedMember;
 use flint_core::display::{
     CUSTOM_NAME_PUNCTUATION, MAX_CUSTOM_NAME_CHARS, clean_custom_name, cluster_name_key,
 };
-use flint_core::handle::{AdmittedMember, LeftOutMember, MemberReport, MemberStatus, OpenedSet};
-use flint_core::keep_watching::BackgroundSignIn;
+#[cfg(any(test, feature = "automation"))]
+use flint_core::handle::MemberStatus;
+use flint_core::handle::{AdmittedMember, LeftOutMember, MemberReport, OpenedSet};
 use flint_core::settings::{ClusterPin, Settings, SettingsError};
 use flint_core::{ClusterId, ClusterSummary, KindId, KindSnapshot, NavEntry, SyncState};
 use gpui_kit::base::TestSupportExt as _;
@@ -47,9 +48,14 @@ use super::super::registry::{
     RenameClusterSet, SaveClusterSet, SelectFirst, SelectLast, SelectNext, SelectPrev,
     ShowClusterSetList, ToggleClusterPicking, TogglePickedCluster,
 };
+use super::super::set_members::{
+    self, MemberAction, MemberCause, MemberLine, failed_cause, paused_text, refusal_cause,
+};
 #[cfg(any(test, feature = "automation"))]
 use super::super::view_state::{ClusterSetsState, OpenSetState, SetGroupState, SetMemberState};
-use super::{WRITES_PAUSED, Workspace, takes_focus, writes_paused_reason};
+#[cfg(any(test, feature = "automation"))]
+use super::WRITES_PAUSED;
+use super::{Workspace, takes_focus, writes_paused_reason};
 
 /// How often the running set's members are asked for what the connection state leaves out.
 const REPORT_EVERY: Duration = Duration::from_secs(1);
@@ -326,46 +332,13 @@ fn rename_problem(saved: &[ClusterSet], id: &str, typed: &str) -> Option<String>
 
 /// Why a row of `pin`'s cluster cannot be opened or acted on, if so. Protection is not here: a
 /// protected cluster's rows open read-only and the write path refuses their actions.
-/// `sign_in_offered` is whether the set bar offers the member's background sign-in.
 pub(super) fn member_refusal(
     pin: &ClusterPin,
     summary: Option<&ClusterSummary>,
     report: Option<&MemberReport>,
     shown: &str,
-    sign_in_offered: bool,
 ) -> Option<String> {
-    let Some(summary) = summary else {
-        return Some(format!("{shown} is no longer in kubeconfig"));
-    };
-    if !summary.confirmed {
-        return Some(format!(
-            "{shown} is provisional: a kubeconfig file defining it can't be read"
-        ));
-    }
-    let on_pin = summary
-        .info
-        .server
-        .as_deref()
-        .is_some_and(|server| pin.matches(&pin.context, server));
-    if !on_pin {
-        return Some(format!("{shown} now points at another server"));
-    }
-    if summary.paused || report.is_some_and(|r| r.paused) {
-        return Some(paused_text(shown));
-    }
-    match &report?.status {
-        MemberStatus::SignInNeeded { .. } if sign_in_offered => Some(format!(
-            "{shown} needs sign-in: allow its background sign-in above the list"
-        )),
-        MemberStatus::SignInNeeded { .. } => {
-            Some(format!("{shown} needs sign-in: select it in the sidebar"))
-        }
-        _ => None,
-    }
-}
-
-fn paused_text(shown: &str) -> String {
-    format!("{shown} is paused: a kubeconfig file defining it can't be read")
+    refusal_cause(pin, summary, report)?.refusal(shown)
 }
 
 /// `snapshot` holding no rows, in `state`: what a member shows before its rows are confirmed as
@@ -381,6 +354,7 @@ fn without_rows(snapshot: &KindSnapshot, state: SyncState) -> Arc<KindSnapshot> 
 
 /// What a member's status note says, when it has something to say. A paused member starts
 /// nothing, so that says it all; otherwise paused writes never hide the connection's state.
+#[cfg(any(test, feature = "automation"))]
 fn member_note(
     report: Option<&MemberReport>,
     sessions_paused: bool,
@@ -813,7 +787,7 @@ impl Workspace {
         let names = self.cluster_names(cx);
         let refused = pins.iter().find_map(|pin| {
             let summary = self.cluster_summary(&pin.context, cx);
-            member_refusal(pin, summary, None, &names.exact(&pin.context), false)
+            member_refusal(pin, summary, None, &names.exact(&pin.context))
         });
         if let Some(why) = refused {
             self.sets.error = Some(why);
@@ -1333,8 +1307,7 @@ impl Workspace {
         }
         let report = run.reports.iter().find(|r| r.cluster == cluster);
         let summary = self.cluster_summary(cluster, cx);
-        let offered = self.offers_member_sign_in(run, cluster, cx);
-        member_refusal(member.pin(), summary, report, &shown, offered).or_else(|| {
+        member_refusal(member.pin(), summary, report, &shown).or_else(|| {
             // The core's published state: never behind what the gate decides.
             summary
                 .is_some_and(|c| self.model.read(cx).sessions_paused(c))
@@ -1403,29 +1376,29 @@ impl Workspace {
             return;
         };
         let names = self.cluster_names(cx);
-        let left: Vec<(ClusterId, String)> =
-            run.members
-                .iter()
-                .filter(|m| !run.changed.contains(m.context()))
-                .filter_map(|m| {
-                    let summary = self.cluster_summary(m.context(), cx);
-                    let on_pin = summary.is_some_and(|c| {
-                        m.same_endpoint(c)
-                            && c.info
-                                .server
-                                .as_deref()
-                                .is_some_and(|server| m.pin().matches(m.context(), server))
-                    });
-                    if on_pin {
-                        return None;
-                    }
-                    let shown = names.exact(m.context());
-                    let why = member_refusal(m.pin(), summary, None, &shown, false).unwrap_or_else(
-                        || format!("{shown} changed since this set opened. Open the set again."),
-                    );
-                    Some((m.context().to_owned(), why))
-                })
-                .collect();
+        let left: Vec<(ClusterId, String)> = run
+            .members
+            .iter()
+            .filter(|m| !run.changed.contains(m.context()))
+            .filter_map(|m| {
+                let summary = self.cluster_summary(m.context(), cx);
+                let on_pin = summary.is_some_and(|c| {
+                    m.same_endpoint(c)
+                        && c.info
+                            .server
+                            .as_deref()
+                            .is_some_and(|server| m.pin().matches(m.context(), server))
+                });
+                if on_pin {
+                    return None;
+                }
+                let shown = names.exact(m.context());
+                let why = member_refusal(m.pin(), summary, None, &shown).unwrap_or_else(|| {
+                    format!("{shown} changed since this set opened. Open the set again.")
+                });
+                Some((m.context().to_owned(), why))
+            })
+            .collect();
         for (cluster, why) in left {
             self.discard_member(&cluster, why, cx);
         }
@@ -1687,6 +1660,10 @@ impl Workspace {
                 })
                 .into_any_element(),
         };
+        // No member can show rows: the member block replaces the chips, the empty list and notes.
+        let body = self
+            .set_empty_state(run, cx)
+            .map_or(body, |lines| self.render_empty_members(lines, theme));
         Some(
             v_flex()
                 .id("cluster-set-view")
@@ -1694,7 +1671,6 @@ impl Workspace {
                 .min_w_0()
                 .h_full()
                 .child(self.render_set_bar(run, theme, cx))
-                .children(self.render_member_sign_ins(run, theme, cx))
                 .child(body)
                 .test_support()
                 .into_any_element(),
@@ -1702,6 +1678,7 @@ impl Workspace {
     }
 
     /// What the set's bar says about `context`, when something is wrong with it.
+    #[cfg(any(test, feature = "automation"))]
     fn set_member_note(&self, run: &RunningSet, context: &str, cx: &App) -> Option<String> {
         if run.disconnected.contains(context) {
             return Some("Disconnected".to_owned());
@@ -1717,47 +1694,115 @@ impl Workspace {
         )
     }
 
-    /// Whether the set bar offers `context`'s background sign-in: it needs sign-in, runs a
-    /// command to get it, and has no consent to run it in the background. An auth provider's
-    /// sign-in is never offered.
-    fn offers_member_sign_in(&self, run: &RunningSet, context: &str, cx: &App) -> bool {
-        let needs = run.reports.iter().any(|r| {
-            r.cluster == context
-                && !r.paused
-                && matches!(r.status, MemberStatus::SignInNeeded { .. })
-        });
-        needs
-            && self
-                .model
-                .read(cx)
-                .keep_watching(context)
-                .is_some_and(|view| view.sign_in == BackgroundSignIn::Off)
-    }
-
-    /// The background sign-in of each member the set bar offers it for, with its keep-watching
-    /// toggle: the overview's controls, giving the same consent.
-    fn render_member_sign_ins(
+    /// What keeps `context` from showing rows, if anything: the cause of a refused row, or a
+    /// connection that failed.
+    pub(super) fn set_member_cause(
         &self,
         run: &RunningSet,
-        theme: &Theme,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        let names = self.cluster_names(cx);
+        context: &str,
+        cx: &App,
+    ) -> Option<MemberCause> {
+        let member = run.members.iter().find(|m| m.context() == context)?;
+        if run.disconnected.contains(context) {
+            return Some(MemberCause::Disconnected);
+        }
+        if run.changed.contains(context) {
+            return Some(MemberCause::Changed);
+        }
+        let report = run.reports.iter().find(|r| r.cluster == context);
+        let summary = self.cluster_summary(context, cx);
+        refusal_cause(member.pin(), summary, report)
+            .or_else(|| {
+                summary
+                    .is_some_and(|c| self.model.read(cx).sessions_paused(c))
+                    .then_some(MemberCause::Paused)
+            })
+            .or_else(|| failed_cause(report))
+    }
+
+    /// The members whose sign-in is what keeps them from showing rows.
+    pub(super) fn signed_out_members(&self, run: &RunningSet, cx: &App) -> HashSet<ClusterId> {
         run.members
             .iter()
-            .map(|member| member.context())
-            .filter(|context| self.offers_member_sign_in(run, context, cx))
-            .filter_map(|context| {
-                let lead = h_flex()
-                    .flex_none()
-                    .gap_2()
-                    .text_xs()
-                    .child(div().child(names.exact(context)))
-                    .child(self.render_keep_watching(context, Some(context), cx))
-                    .into_any_element();
-                self.background_sign_in_row(context, Some(context), Some(lead), theme, cx)
-            })
+            .map(|m| m.context())
+            .filter(|c| self.set_member_cause(run, c, cx) == Some(MemberCause::SignIn))
+            .map(str::to_owned)
             .collect()
+    }
+
+    /// One row per member with its cause, while no member can show rows. `None` otherwise, and
+    /// while the set shows its dashboard, a row or any rows.
+    pub(super) fn set_empty_state(&self, run: &RunningSet, cx: &App) -> Option<Vec<MemberLine>> {
+        // An open row (an unapplied edit stays on show) or rows a surviving watch still supplies
+        // keep the list: the block only stands in for a list with nothing to show.
+        if run.dashboard.is_some() || self.detail.is_some() {
+            return None;
+        }
+        let names = self.cluster_names(cx);
+        let members: set_members::MemberCauses = run
+            .members
+            .iter()
+            .map(|m| {
+                let context = m.context();
+                let cause = self.set_member_cause(run, context, cx);
+                (context.to_owned(), names.exact(context), cause)
+            })
+            .collect();
+        // A pause stops nothing already running: a paused member's watch may still fill rows.
+        let paused_rows = run.snapshots.iter().any(|snapshot| {
+            !snapshot.rows.is_empty()
+                && members.iter().any(|(context, _, cause)| {
+                    *context == snapshot.cluster && *cause == Some(MemberCause::Paused)
+                })
+        });
+        if paused_rows {
+            return None;
+        }
+        set_members::empty_state(members)
+    }
+
+    /// The empty-state block: each member by its full name, why it shows nothing, and what to do.
+    fn render_empty_members(&self, lines: Vec<MemberLine>, theme: &Theme) -> AnyElement {
+        v_flex()
+            .id("set-members-empty")
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .text_sm()
+            .children(lines.into_iter().map(
+                |MemberLine {
+                     cluster,
+                     shown,
+                     cause,
+                 }| {
+                    let line = cause.line();
+                    h_flex()
+                        .id(SharedString::from(format!("set-member-empty-{cluster}")))
+                        .gap_3()
+                        .items_center()
+                        .aria_label(format!("{shown}: {line}"))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(shown))
+                        .child(div().text_color(theme.muted_foreground).child(line))
+                        .children(cause.action().map(|action| {
+                            let id = SharedString::from(format!("set-member-action-{cluster}"));
+                            let button = Button::new(id).xsmall().outline().label(action.label());
+                            match action {
+                                MemberAction::SignIn => button.on_click(registry::on_click(
+                                    set_members::sign_in_member(&cluster),
+                                )),
+                                MemberAction::Retry => button.on_click(registry::on_click(
+                                    set_members::retry_member(&cluster),
+                                )),
+                            }
+                        }))
+                        .test_support()
+                },
+            ))
+            .test_support()
+            .into_any_element()
     }
 
     /// The sidebar's choice, the saved sets and the running set, as data.
@@ -1777,14 +1822,6 @@ impl Workspace {
                         SetMemberState {
                             cluster: cluster.to_owned(),
                             note: self.set_member_note(run, cluster, cx),
-                            background_sign_in: self.offers_member_sign_in(run, cluster, cx).then(
-                                || {
-                                    self.model
-                                        .read(cx)
-                                        .keep_watching(cluster)
-                                        .is_some_and(|view| view.sign_in == BackgroundSignIn::On)
-                                },
-                            ),
                             tag: shown
                                 .iter()
                                 .find(|m| m.cluster() == cluster)
@@ -1818,7 +1855,7 @@ impl Workspace {
         }
     }
 
-    /// The set's name, each member's exact name with anything wrong with it, and Close.
+    /// The set's name, the members left out of it, and its buttons.
     fn render_set_bar(&self, run: &RunningSet, theme: &Theme, cx: &App) -> impl IntoElement {
         let names = self.cluster_names(cx);
         h_flex()
@@ -1835,22 +1872,6 @@ impl Workspace {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(run.label.clone()),
             )
-            .children(run.members.iter().map(|member| {
-                let context = member.context();
-                let shown = names.exact(context);
-                let note = self.set_member_note(run, context, cx);
-                let noted = note.is_some();
-                let text = match note {
-                    Some(note) => format!("{shown}: {note}"),
-                    None => shown,
-                };
-                div()
-                    .id(SharedString::from(format!("set-member-{context}")))
-                    .aria_label(text.clone())
-                    .when(noted, |el| el.text_color(theme.warning))
-                    .child(text)
-                    .test_support()
-            }))
             .children(
                 run.left_out
                     .iter()
