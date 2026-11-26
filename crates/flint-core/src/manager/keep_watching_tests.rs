@@ -1300,8 +1300,8 @@ fn click_sign_in(manager: &mut ClusterManager) -> Result<(), String> {
     manager.sign_in_member(&member, view.definition, view.shown_sign_in)
 }
 
-// The click runs the member's plugin once, attended, and grants nothing more: no consent is
-// kept, the background sign-in stays off, and the connection may not run the plugin again.
+// The click runs the member's plugin once, with no input, and grants nothing more: no consent
+// is kept, the background sign-in stays off, and the connection may not run the plugin again.
 #[tokio::test]
 async fn a_signed_out_member_signs_in_once_from_the_set_view() {
     let plugin = token_plugin();
@@ -1325,7 +1325,11 @@ async fn a_signed_out_member_signs_in_once_from_the_set_view() {
     let slot = manager.cluster("dev").unwrap();
     assert!(
         !slot.access.unattended(),
-        "attended, like a selected cluster"
+        "not a kept connection: a failure ends nothing kept"
+    );
+    assert!(
+        slot.access.takes_no_input(),
+        "its program can't prompt and gets a null stdin"
     );
     let again = slot.access.grant(CredentialSource::Plugin).lease();
     assert!(again.launch_refusal().await.is_some(), "no second start");

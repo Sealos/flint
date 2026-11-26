@@ -740,6 +740,11 @@ async fn a_sign_in_once_starts_once() {
     assert!(grant.allowed());
     assert!(!access.unattended(), "the person who clicked is there");
     assert!(access.signed_in_once_access());
+    assert!(
+        access.takes_no_input() && grant.lease().takes_no_input(),
+        "its program can't prompt and gets a null stdin"
+    );
+    assert!(!CredentialAccess::new(Arc::new(ForegroundOnly), Role::Foreground).takes_no_input());
     assert!(!access.grant(CredentialSource::AuthProvider).allowed());
     let first = grant.lease();
     assert!(

@@ -25,7 +25,7 @@
 //! # Bounds
 //!
 //! Objects are cut down to what classification reads, and pods' requests and limits to per-node
-//! totals, at most [`MAX_OBJECTS_PER_KIND`] per kind.
+//! totals and one [`PodRecord`] per pod, at most [`MAX_OBJECTS_PER_KIND`] per kind.
 //! A kind over that limit is reported as [`KindCheck::TooLarge`] rather than counted in part.
 //! Retries back off up to [`TelemetryTiming::backoff_max`], and lists run a few at a time.
 
@@ -36,6 +36,7 @@ mod feed;
 mod kept_discovery;
 mod metrics;
 mod objects;
+mod pods;
 mod problems;
 mod side;
 mod usage;
@@ -69,6 +70,7 @@ pub use kept_discovery::KeptCoverage;
 pub(crate) use kept_discovery::{DiscoveryPace, KeptDiscovery};
 pub use objects::MAX_OBJECTS_PER_KIND;
 use objects::Stores;
+pub use pods::{Controllers, PodIndex, PodOwner, PodRecord};
 use side::SideFeed;
 pub use side::{PodKey, SideRead, SideReads, UsageRead};
 
@@ -220,6 +222,8 @@ pub struct TelemetrySnapshot {
     pub metrics: MetricsCheck,
     /// `None` while nodes cannot be relied on.
     pub capacity: Option<ClusterCapacity>,
+    /// Each pod's requests, limits, node and owner. `None` while pods cannot be relied on.
+    pub pods: Option<PodIndex>,
     pub inventory: Inventory,
     /// The Deployments mid-rollout, stalled or just finished, one per Deployment. Empty while
     /// Deployments cannot be read.
@@ -242,6 +246,7 @@ impl TelemetrySnapshot {
             counts: summariser.summarise(&ProblemSnapshot::unavailable(), at),
             metrics: MetricsCheck::Waiting,
             capacity: None,
+            pods: None,
             inventory: Inventory::default(),
             rollouts: Arc::from([]),
             version: VersionCheck::Waiting,
@@ -277,6 +282,7 @@ impl TelemetrySnapshot {
             && self.counts == other.counts
             && self.metrics == other.metrics
             && self.capacity == other.capacity
+            && self.pods == other.pods
             && self.inventory == other.inventory
             && self.rollouts == other.rollouts
             && self.version == other.version
@@ -436,7 +442,7 @@ impl Telemetry {
             timing.list_timeout,
         ));
         tasks.spawn(metrics::run(
-            Arc::clone(&cluster),
+            latest.clone(),
             client,
             requests,
             trends,

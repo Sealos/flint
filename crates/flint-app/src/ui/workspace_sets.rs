@@ -146,6 +146,10 @@ impl RunningSet {
     }
 }
 
+pub(super) fn sidebar_set_members(run: Option<&RunningSet>) -> Option<Vec<&str>> {
+    run.map(|run| run.current_members().map(AdmittedMember::context).collect())
+}
+
 impl ClusterSets {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Set name"));
@@ -516,7 +520,17 @@ impl Workspace {
             return;
         }
         self.sets.error = None;
-        // A Cmd-click starts choosing from outside the choosing mode.
+        // A Cmd-click from an empty selection combines the active and clicked clusters.
+        if !self.sets.picking
+            && self.sets.picked.is_empty()
+            && let Some(active) = self.model.read(cx).active_cluster()
+            && active.info.name != action.cluster
+            && let Some(server) = &active.info.server
+        {
+            self.sets
+                .picked
+                .push(ClusterPin::new(active.info.name.clone(), server.clone()));
+        }
         self.sets.picking = true;
         let at = self
             .sets
@@ -1742,6 +1756,12 @@ impl Workspace {
         cx: &App,
     ) -> Option<MemberCause> {
         let member = run.members.iter().find(|m| m.context() == context)?;
+        if run.disconnected.contains(context) {
+            return Some(MemberCause::Disconnected);
+        }
+        if run.changed.contains(context) {
+            return Some(MemberCause::Changed);
+        }
         let report = run.reports.iter().find(|r| r.cluster == context);
         let summary = self.cluster_summary(context, cx);
         refusal_cause(member.pin(), summary, report)
@@ -1764,22 +1784,34 @@ impl Workspace {
     }
 
     /// One row per member with its cause, while no member can show rows. `None` otherwise, and
-    /// while the set shows its dashboard.
+    /// while the set shows its dashboard, a row or any rows.
     pub(super) fn set_empty_state(&self, run: &RunningSet, cx: &App) -> Option<Vec<MemberLine>> {
-        if run.dashboard.is_some() {
+        // An open row (an unapplied edit stays on show) or rows a surviving watch still supplies
+        // keep the list: the block only stands in for a list with nothing to show.
+        if run.dashboard.is_some() || self.detail.is_some() {
             return None;
         }
         let names = self.cluster_names(cx);
-        set_members::empty_state(
-            run.members
-                .iter()
-                .map(|m| {
-                    let context = m.context();
-                    let cause = self.set_member_cause(run, context, cx);
-                    (context.to_owned(), names.exact(context), cause)
+        let members: set_members::MemberCauses = run
+            .members
+            .iter()
+            .map(|m| {
+                let context = m.context();
+                let cause = self.set_member_cause(run, context, cx);
+                (context.to_owned(), names.exact(context), cause)
+            })
+            .collect();
+        // A pause stops nothing already running: a paused member's watch may still fill rows.
+        let paused_rows = run.snapshots.iter().any(|snapshot| {
+            !snapshot.rows.is_empty()
+                && members.iter().any(|(context, _, cause)| {
+                    *context == snapshot.cluster && *cause == Some(MemberCause::Paused)
                 })
-                .collect(),
-        )
+        });
+        if paused_rows {
+            return None;
+        }
+        set_members::empty_state(members)
     }
 
     /// The empty-state block: each member by its full name, why it shows nothing, and what to do.
@@ -1820,6 +1852,7 @@ impl Workspace {
                             };
                             let button = Button::new(id).xsmall().outline().label(label);
                             match action {
+                                // not-an-action: the click is the consent for one sign-in run.
                                 MemberAction::SignIn => button.on_click(sign_in.on_click(&cluster)),
                                 MemberAction::Retry => button.on_click(registry::on_click(
                                     set_members::retry_member(&cluster),
@@ -1964,9 +1997,15 @@ impl Workspace {
         })
     }
 
-    /// The sidebar's foot: saved sets, and the controls for choosing clusters.
-    pub(super) fn render_sets_panel(&self, theme: &Theme, cx: &App) -> impl IntoElement {
+    /// The sidebar's foot: cluster sets and the controls for choosing clusters.
+    pub(super) fn render_sets_panel(
+        &self,
+        open_count: Option<usize>,
+        theme: &Theme,
+        cx: &App,
+    ) -> impl IntoElement {
         let sets = &self.sets;
+        let open_id = sets.running.as_ref().and_then(|run| run.set_id.as_deref());
         let count = sets.picked.len();
         let can_run = (MIN_CLUSTER_SET_MEMBERS..=MAX_CLUSTER_SET_MEMBERS).contains(&count);
         let typed = sets.name_input.read(cx).value().trim().to_string();
@@ -1991,6 +2030,9 @@ impl Workspace {
             })
             .children(sets.saved.iter().map(|set| {
                 let name = set.name.clone();
+                let count = open_count
+                    .filter(|_| open_id == Some(set.id.as_str()))
+                    .unwrap_or(set.members.len());
                 let open = self
                     .sets
                     .running
@@ -2011,6 +2053,8 @@ impl Workspace {
                                 IconName::Folder
                             }))
                             .label(name.clone())
+                            .accessibility_label(format!("{name} ({count})"))
+                            .child(div().flex_none().child(format!("({count})")))
                             .selected(open)
                             .on_click(registry::on_click(OpenClusterSet { name: name.clone() })),
                     )
@@ -2023,6 +2067,17 @@ impl Workspace {
                         ))
                     })
             }))
+            .when_some(open_count.filter(|_| open_id.is_none()), |el, count| {
+                let label = format!("Open set ({count})");
+                el.child(
+                    div()
+                        .id("open-unsaved-set")
+                        .aria_label(label.clone())
+                        .text_center()
+                        .child(label)
+                        .test_support(),
+                )
+            })
             .child(
                 Button::new("toggle-cluster-picking")
                     .xsmall()

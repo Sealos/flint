@@ -1005,11 +1005,17 @@ impl Workspace {
                         c.provisional || c.paused,
                     )
                 });
+        let thresholds = self
+            .model
+            .read(cx)
+            .settings
+            .thresholds_for(&cluster, server.as_deref());
         detail.update(cx, |d, cx| {
             d.set_sessions_blocked(why, cx);
             d.set_protected(protected, label, cx);
             d.set_row_writes_paused(writes_paused, cx);
             d.set_server(server);
+            d.set_thresholds(thresholds, cx);
             match endpoint {
                 Some(Some(endpoint)) => d.note_endpoint(endpoint, cx),
                 Some(None) => {}
@@ -1716,6 +1722,7 @@ impl Workspace {
     ) -> impl IntoElement {
         let model = self.model.read(cx);
         let active = model.active.clone();
+        let open_members = sets::sidebar_set_members(self.sets.running.as_ref());
 
         // Scrolls by itself, so the keyboard cursor can bring a cluster row into view
         // (`Workspace::move_sidebar_cursor`): its rows are its children.
@@ -1753,6 +1760,9 @@ impl Workspace {
         let states = self.nav.read(cx).states();
         for cluster in &model.clusters {
             let is_active = active.as_deref() == Some(cluster.info.name.as_str());
+            let set_member = open_members
+                .as_deref()
+                .is_some_and(|members| members.contains(&cluster.info.name.as_str()));
             let presence = Presence::of(&cluster.state, is_active, states);
             let exposure = (model.ai_exposure(cluster), model.ai_scope(cluster));
             let settings_ok = model.settings_error.is_none();
@@ -1772,6 +1782,7 @@ impl Workspace {
                 (
                     is_active,
                     ring,
+                    set_member,
                     presence,
                     cluster_details(model, cluster, states),
                 ),
@@ -1834,7 +1845,7 @@ impl Workspace {
             .border_color(theme.sidebar_border)
             .child(pane_title("CLUSTERS", traffic_lights, theme))
             .child(list)
-            .child(self.render_sets_panel(theme, cx))
+            .child(self.render_sets_panel(open_members.as_ref().map(Vec::len), theme, cx))
             .child(self.render_settings_entry(theme))
             .child(pane_handle(
                 "clusters-edge",
@@ -1846,9 +1857,7 @@ impl Workspace {
     fn render_cluster_row(
         &self,
         cluster: &ClusterSummary,
-        // Whether it is the active cluster, whether the sidebar's cursor is on it, its presence
-        // and its full description.
-        (is_active, ring, presence, tooltip): (bool, bool, Presence<'_>, String),
+        (is_active, ring, set_member, presence, tooltip): (bool, bool, bool, Presence<'_>, String),
         (exposure, ai_scope): (AiExposureState, Option<AiScope>),
         (protection, trust, writes_paused): (Protection, TrustState, bool),
         (settings_ok, names, tag, (keep, keep_sign_in), can_disconnect): (
@@ -1930,6 +1939,19 @@ impl Workspace {
                         h_flex()
                             .gap_1p5()
                             .min_w_0()
+                            .when(set_member, |line| {
+                                let label = "Member of the open cluster set";
+                                line.child(
+                                    theme::status_dot(theme.list_active_border, false)
+                                        .id(SharedString::from(format!("cluster-set-mark-{name}")))
+                                        .flex_none()
+                                        .aria_label(label)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(label).build(window, cx)
+                                        })
+                                        .test_support(),
+                                )
+                            })
                             .child(
                                 div()
                                     .min_w_0()
@@ -3896,6 +3918,28 @@ fn namespace_button_text(filter: &[String], limit: Option<&flint_core::Namespace
     }
 }
 
+impl Workspace {
+    /// Builds the menu bar again once this render is over, when the active cluster, the clusters
+    /// listed or what an action can do changed (the guards read the workspace, which is being
+    /// updated now).
+    fn sync_menus(&self, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        let cluster = model.active_cluster().map(|c| c.info.name.clone());
+        let names = model.names();
+        let clusters: Vec<(String, String)> = model
+            .clusters
+            .iter()
+            .map(|c| (c.info.name.clone(), names.with_real(&c.info.name)))
+            .collect();
+        cx.defer(move |cx| {
+            super::app_menus::update(cx, |inputs| {
+                inputs.cluster = cluster;
+                inputs.clusters = clusters;
+            })
+        });
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_namespace_picker_with_dialog(window, cx);
@@ -3908,6 +3952,7 @@ impl Render for Workspace {
         let window_height = f32::from(window.viewport_size().height);
         self.sync_narrow_layout(window_width, window, cx);
         self.two_row_header = self.header_has_two_rows(window_width, cx);
+        self.sync_menus(cx);
         let cx: &Context<Self> = cx;
         let theme = cx.theme();
         let has_cluster = self.model.read(cx).active_cluster().is_some();

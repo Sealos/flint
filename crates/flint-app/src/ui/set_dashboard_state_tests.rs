@@ -36,6 +36,7 @@ fn card(cluster: &str, state: CardState, failing: Option<u32>) -> SetCard {
         level: ThresholdLevel::Healthy,
         cpu: None,
         memory: None,
+        metrics_notice: None,
         short_kinds: vec!["pods"],
         feed: counting.then(|| FeedId::for_test(cluster)),
         state,
@@ -71,6 +72,21 @@ fn a_member_that_cannot_be_read_has_a_card_that_counts_nothing() {
     assert_eq!(down.note.as_deref(), Some("gone"));
     assert!(down.counts.iter().all(|c| c.count.is_none() && !c.opens));
     assert_eq!(state.cards[0].cluster, "up");
+}
+
+#[test]
+fn a_partially_checked_member_reports_its_metrics_notice_too() {
+    let mut member = card(
+        "member",
+        CardState::Partial("Could not check pods.".into()),
+        Some(0),
+    );
+    member.metrics_notice = Some("No metrics-server installed.".into());
+    let state = assemble(vec![member]).view_state();
+    assert_eq!(
+        state.cards[0].note.as_deref(),
+        Some("Could not check pods. No metrics-server installed.")
+    );
 }
 
 #[test]

@@ -223,8 +223,9 @@ impl CredentialAccess {
     }
 
     /// Access for a running-set member's connection the person asked to sign in once, now
-    /// ([`SignedInOnce`]). It is attended: the person who clicked is there, so its program may
-    /// prompt or open a browser as a selected cluster's does. Before its one start, `verify`
+    /// ([`SignedInOnce`]). The person who clicked is there, so its program may open a browser,
+    /// but it runs in the background with no input ([`Self::takes_no_input`]): it can't prompt,
+    /// and its stdin is null. Before its one start, `verify`
     /// must accept the definition, and that start uses the click up whatever `verify` answers.
     /// Any later start is refused and retires the access for good, and `on_spent` is told, so
     /// nothing retries it and the member asks for a sign-in again. The manager never keeps this
@@ -265,6 +266,12 @@ impl CredentialAccess {
     /// Whether this is the access of a member signed in once ([`Self::signed_in_once`]).
     pub(crate) fn signed_in_once_access(&self) -> bool {
         self.once
+    }
+
+    /// Whether its program runs with no input: it may not prompt, and its stdin is null. A kept
+    /// connection's ([`Self::unattended`]) and a member's signed in once.
+    pub(crate) fn takes_no_input(&self) -> bool {
+        self.unattended() || self.once
     }
 
     /// Whether this is a kept connection's access: nobody answers its program's prompts.
@@ -398,6 +405,11 @@ impl CredentialGrant {
         self.access.on_failure.is_some()
     }
 
+    /// [`CredentialAccess::takes_no_input`].
+    pub(crate) fn takes_no_input(&self) -> bool {
+        self.access.takes_no_input()
+    }
+
     /// Whether a 401 was recorded since this was last asked.
     pub(crate) fn take_refused(&self) -> bool {
         self.refused.swap(false, Ordering::Relaxed)
@@ -475,6 +487,11 @@ impl CredentialLease {
     /// [`CredentialGrant::unattended`].
     pub(crate) fn unattended(&self) -> bool {
         self.grant.unattended()
+    }
+
+    /// [`CredentialAccess::takes_no_input`].
+    pub(crate) fn takes_no_input(&self) -> bool {
+        self.grant.takes_no_input()
     }
 
     /// Counts a plugin as running until the returned value is dropped, for a kept connection.

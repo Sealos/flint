@@ -1308,6 +1308,7 @@ impl CombinedResourceList {
                 .cursor_pointer()
                 .aria_label(sign_in.label(cluster))
                 .child(chip)
+                // not-an-action: the click is the consent for one sign-in run.
                 .on_click(sign_in.on_click(cluster))
                 .test_support()
                 .into_any_element(),

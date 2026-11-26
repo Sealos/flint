@@ -1,7 +1,8 @@
 //! The bridge between a UI (or any other front end) and the core (ADR-0002).
 //!
-//! The core runs on its own multi-thread tokio runtime. Front ends send [`Command`]s over
-//! `async_channel` channels and read [`Event`]s from a bounded queue ([`crate::events`]) that
+//! The core runs on its own multi-thread tokio runtime. Front ends send [`Command`]s (and the
+//! requests behind the other methods) over unbounded queues (`core_queue`), so none is
+//! lost to a full queue, and read [`Event`]s from a bounded queue ([`crate::events`]) that
 //! keeps the latest state of each kind; both work with any executor, so a GPUI task can await
 //! them directly. Nothing here blocks the caller.
 
@@ -739,8 +740,8 @@ const CORE_WORKER_THREADS: usize = 4;
 /// dropped.
 #[derive(Clone)]
 pub struct CoreHandle {
-    commands: async_channel::Sender<Command>,
-    requests: async_channel::Sender<Request>,
+    commands: crate::core_queue::CoreQueue<Command>,
+    requests: crate::core_queue::CoreQueue<Request>,
     events: crate::events::EventSource,
     hubs: HubRegistry,
     next_subscription: Arc<AtomicU64>,
@@ -771,8 +772,8 @@ impl CoreHandle {
             .thread_name("flint-core")
             .enable_all()
             .build()?;
-        let (cmd_tx, cmd_rx) = async_channel::unbounded();
-        let (req_tx, req_rx) = async_channel::unbounded();
+        let (cmd_tx, cmd_rx) = crate::core_queue::CoreQueue::new();
+        let (req_tx, req_rx) = crate::core_queue::CoreQueue::new();
         let (event_tx, event_rx) = crate::events::queue();
         let hubs = HubRegistry::default();
         let unlocks = SessionUnlocks::default();
@@ -810,7 +811,7 @@ impl CoreHandle {
     /// stopped.
     pub fn running_set(&self) -> impl Future<Output = Vec<MemberReport>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::RunningSet { reply });
+        let _ = self.requests.push(Request::RunningSet { reply });
         async move { rx.await.unwrap_or_default() }
     }
 
@@ -822,7 +823,7 @@ impl CoreHandle {
     > + Send
     + 'static {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::KeepWatching { reply });
+        let _ = self.requests.push(Request::KeepWatching { reply });
         async move { rx.await.unwrap_or_default() }
     }
 
@@ -836,7 +837,7 @@ impl CoreHandle {
     ) -> impl Future<Output = Result<crate::keep_watching::PluginOffer, String>> + Send + use<>
     {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::OfferKeepWatching {
+        let _ = self.requests.push(Request::OfferKeepWatching {
             cluster: cluster.to_owned(),
             shown,
             reply,
@@ -919,7 +920,7 @@ impl CoreHandle {
             }
         };
         rx.mark_changed();
-        let _ = self.requests.try_send(request);
+        let _ = self.requests.push(request);
         Subscription {
             id,
             cluster: cluster.to_owned(),
@@ -938,7 +939,7 @@ impl CoreHandle {
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         let (live, seen) = watch::channel(false);
         if matches!(self.read_binding(cluster), Ok(None)) {
-            let _ = self.requests.try_send(Request::OpenOverviewOn {
+            let _ = self.requests.push(Request::OpenOverviewOn {
                 id,
                 cluster: cluster.to_owned(),
                 generation,
@@ -963,9 +964,7 @@ impl CoreHandle {
         pins: Vec<ClusterPin>,
     ) -> impl Future<Output = Result<OpenedSet, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self
-            .requests
-            .try_send(Request::OpenRunningSet { pins, reply });
+        let sent = self.requests.push(Request::OpenRunningSet { pins, reply });
         async move {
             if sent.is_err() {
                 return Err("the core is not running".to_owned());
@@ -983,9 +982,7 @@ impl CoreHandle {
         pins: Vec<ClusterPin>,
     ) -> impl Future<Output = Result<Vec<AdmittedMember>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self
-            .requests
-            .try_send(Request::AdmitRunningSet { pins, reply });
+        let sent = self.requests.push(Request::AdmitRunningSet { pins, reply });
         async move {
             if sent.is_err() {
                 return Err("the core is not running".to_owned());
@@ -1010,7 +1007,7 @@ impl CoreHandle {
         shown: Option<u64>,
     ) -> impl Future<Output = Result<(), String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::SignInMember {
+        let sent = self.requests.push(Request::SignInMember {
             member: member.clone(),
             definition,
             shown,
@@ -1031,7 +1028,7 @@ impl CoreHandle {
         member: &AdmittedMember,
     ) -> impl Future<Output = Option<String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::CheckMember {
+        let sent = self.requests.push(Request::CheckMember {
             member: member.clone(),
             reply,
         });
@@ -1108,7 +1105,7 @@ impl CoreHandle {
         let sent = match binding {
             Ok(member) => self
                 .requests
-                .try_send(Request::FetchObject {
+                .push(Request::FetchObject {
                     cluster: cluster.to_owned(),
                     kind: kind.clone(),
                     namespace: namespace.map(str::to_owned),
@@ -1143,7 +1140,7 @@ impl CoreHandle {
         name: &str,
     ) -> impl Future<Output = Result<Arc<ObjectDetail>, String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::FetchPinnedObject {
+        let sent = self.requests.push(Request::FetchPinnedObject {
             cluster: cluster.to_owned(),
             pin: pin.clone(),
             kind: kind.clone(),
@@ -1168,7 +1165,7 @@ impl CoreHandle {
         cluster: &str,
     ) -> impl Future<Output = Option<Arc<ClusterDiscovery>>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::Discovery {
+        let _ = self.requests.push(Request::Discovery {
             cluster: cluster.to_owned(),
             reply,
         });
@@ -1185,7 +1182,7 @@ impl CoreHandle {
         generation: u64,
     ) -> impl Future<Output = Result<(), ActivationRefused>> + Send + 'static + use<> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::ActivatePinned {
+        let _ = self.requests.push(Request::ActivatePinned {
             cluster: cluster.to_owned(),
             pin,
             generation,
@@ -1202,7 +1199,7 @@ impl CoreHandle {
         &self,
     ) -> impl Future<Output = Result<(), ReloadError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::ReloadKubeconfig { reply });
+        let _ = self.requests.push(Request::ReloadKubeconfig { reply });
         async move { reload_outcome(rx.await.ok()) }
     }
 
@@ -1216,9 +1213,7 @@ impl CoreHandle {
         writes: Vec<crate::settings::SettingsWrite>,
     ) -> impl Future<Output = Result<(), String>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self
-            .requests
-            .try_send(Request::WriteSettings { writes, reply });
+        let sent = self.requests.push(Request::WriteSettings { writes, reply });
         async move {
             if sent.is_err() {
                 return Err("the settings could not be sent to be written".to_owned());
@@ -1235,7 +1230,7 @@ impl CoreHandle {
         cluster: &str,
     ) -> impl Future<Output = Vec<(KindId, Feed)>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let _ = self.requests.try_send(Request::WatchedKinds {
+        let _ = self.requests.push(Request::WatchedKinds {
             cluster: cluster.to_owned(),
             reply,
         });
@@ -1345,7 +1340,7 @@ impl CoreHandle {
         let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
         let budget = crate::logs::Budgeted::new(self.log_budget.clone(), id);
         let trim_cutoff = budget.cutoff();
-        let _ = self.requests.try_send(Request::OpenLogs {
+        let _ = self.requests.push(Request::OpenLogs {
             id,
             cluster: cluster.to_owned(),
             server,
@@ -1487,7 +1482,7 @@ impl CoreHandle {
         pin: HelmPin,
     ) -> impl Future<Output = Result<HelmTarget, HelmError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::HelmTarget {
+        let sent = self.requests.push(Request::HelmTarget {
             cluster: cluster.to_owned(),
             pin,
             member: self.bound.as_deref().cloned(),
@@ -1509,7 +1504,7 @@ impl CoreHandle {
         cluster: &str,
     ) -> impl Future<Output = Result<HelmPin, HelmError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::HelmPin {
+        let sent = self.requests.push(Request::HelmPin {
             cluster: cluster.to_owned(),
             reply,
         });
@@ -1579,7 +1574,7 @@ impl CoreHandle {
     ) -> impl Future<Output = Result<(GatedClient, ContextPin), WriteRefusal>> + Send + 'static
     {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::WriteClient {
+        let sent = self.requests.push(Request::WriteClient {
             cluster: cluster.to_owned(),
             server,
             reply,
@@ -1602,7 +1597,7 @@ impl CoreHandle {
         on: Option<SlotBinding>,
     ) -> impl Future<Output = Result<BoundWriteClient, WriteError>> + Send + 'static {
         let (reply, rx) = oneshot::channel();
-        let sent = self.requests.try_send(Request::BoundWriteClient {
+        let sent = self.requests.push(Request::BoundWriteClient {
             cluster: cluster.to_owned(),
             server,
             on,
@@ -1741,14 +1736,14 @@ impl CoreHandle {
                 Some(member) => {
                     let (reply, rx) = oneshot::channel();
                     requests
-                        .try_send(Request::MemberClient { member, reply })
+                        .push(Request::MemberClient { member, reply })
                         .map_err(|_| NOT_RUNNING.to_owned())?;
                     rx.await.unwrap_or_else(|_| Err(STOPPED.to_owned()))
                 }
                 None => {
                     let (reply, rx) = oneshot::channel();
                     requests
-                        .try_send(Request::Client {
+                        .push(Request::Client {
                             cluster: cluster.clone(),
                             reply,
                         })
@@ -1761,7 +1756,9 @@ impl CoreHandle {
         }
     }
 
-    /// Sends a command. Never blocks. Commands sent after the core stopped are dropped.
+    /// Sends a command. Never blocks, and is never dropped for a full queue: commands are taken
+    /// in the order sent (`core_queue`). Commands sent after the core stopped are
+    /// dropped.
     pub fn send(&self, command: Command) {
         // Ending a grant does not wait its turn behind a save the queue may be stuck on.
         if let Command::RevokeBackgroundSignIn(cluster)
@@ -1777,7 +1774,7 @@ impl CoreHandle {
         if let Command::DisconnectCluster(cluster) = &command {
             self.disconnects.bump(cluster);
         }
-        if self.commands.try_send(command).is_err() {
+        if self.commands.push(command).is_err() {
             tracing::warn!("core is not running; command dropped");
         }
     }
@@ -1800,7 +1797,7 @@ pub struct Subscription {
     kind: KindId,
     /// `None` only while dropping, so the receiver is gone before the manager hears about it.
     rx: Option<watch::Receiver<Arc<KindSnapshot>>>,
-    requests: async_channel::Sender<Request>,
+    requests: crate::core_queue::CoreQueue<Request>,
 }
 
 impl Subscription {
@@ -1843,7 +1840,7 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         // Drop the receiver first: the manager releases the hub only when nobody listens.
         self.rx = None;
-        let _ = self.requests.try_send(Request::Unsubscribe { id: self.id });
+        let _ = self.requests.push(Request::Unsubscribe { id: self.id });
     }
 }
 
@@ -1851,7 +1848,7 @@ impl Drop for Subscription {
 #[derive(Debug)]
 pub struct OverviewInterest {
     id: u64,
-    requests: async_channel::Sender<Request>,
+    requests: crate::core_queue::CoreQueue<Request>,
     /// Set by [`CoreHandle::open_overview_on`].
     bound: Option<BoundOverview>,
 }
@@ -1887,9 +1884,7 @@ impl OverviewInterest {
 
 impl Drop for OverviewInterest {
     fn drop(&mut self) {
-        let _ = self
-            .requests
-            .try_send(Request::CloseOverview { id: self.id });
+        let _ = self.requests.push(Request::CloseOverview { id: self.id });
     }
 }
 
@@ -1911,7 +1906,7 @@ pub struct LogSession {
     options: LogOptions,
     rx: watch::Receiver<Arc<LogSnapshot>>,
     paused: watch::Sender<bool>,
-    requests: async_channel::Sender<Request>,
+    requests: crate::core_queue::CoreQueue<Request>,
     budget: Arc<crate::logs::LogBudget>,
     trim_cutoff: Arc<AtomicU64>,
 }
@@ -2021,7 +2016,7 @@ impl LogUpdates {
 
 impl Drop for LogSession {
     fn drop(&mut self) {
-        let _ = self.requests.try_send(Request::CloseLogs { id: self.id });
+        let _ = self.requests.push(Request::CloseLogs { id: self.id });
     }
 }
 
@@ -2050,13 +2045,13 @@ impl Drop for RuntimeGuard {
 /// Asks the cluster manager whether `cluster` changed since `pin`, for a session pinned there.
 /// While the core is busy or stopped, the session goes on: it has its own client.
 fn context_check(
-    requests: async_channel::Sender<Request>,
+    requests: crate::core_queue::CoreQueue<Request>,
     cluster: ClusterId,
     pin: ContextPin,
 ) -> ContextCheck {
     Arc::new(move || {
         let (reply, rx) = oneshot::channel();
-        let sent = requests.try_send(Request::CheckContext {
+        let sent = requests.push(Request::CheckContext {
             cluster: cluster.clone(),
             pin: pin.clone(),
             reply,
@@ -2073,7 +2068,7 @@ fn context_check(
 /// Asks the cluster manager's write gate about `cluster` as pinned at `pin`, each time it is
 /// called. With the core gone, the answer is a refusal.
 pub(crate) fn launch_check(
-    requests: async_channel::Sender<Request>,
+    requests: crate::core_queue::CoreQueue<Request>,
     cluster: ClusterId,
     pin: ContextPin,
 ) -> LaunchCheck {
@@ -2123,6 +2118,96 @@ mod tests {
             watch_timing: Default::default(),
         })
         .unwrap()
+    }
+
+    // #730: a flood of commands and requests loses nothing behind it. A settings change and a
+    // write's gate check sent among them each arrive once, the settings change in the order sent.
+    #[tokio::test]
+    async fn a_flood_loses_no_settings_change_or_write_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let kubeconfig = dir.path().join("kubeconfig");
+        let mut contents = String::from(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: https://127.0.0.1:1\nusers:\n- name: u\n  user:\n    token: t\ncontexts:\n",
+        );
+        for name in ["one", "two"] {
+            contents += &format!("- name: {name}\n  context:\n    cluster: c\n    user: u\n");
+        }
+        std::fs::write(&kubeconfig, contents).unwrap();
+        let config = dir.path().join("config");
+        let core = CoreHandle::start(CoreConfig {
+            config_dir: config.clone(),
+            settings: Settings::default(),
+            settings_error: None,
+            kubeconfig_base: vec![kubeconfig],
+            home: None,
+            watch_files: false,
+            watch_timing: Default::default(),
+        })
+        .unwrap();
+        let events = core.events();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(events.recv().await, Ok(Event::ClustersChanged(_))) {}
+        })
+        .await
+        .expect("the kubeconfig loads");
+
+        let flood = |core: &CoreHandle| {
+            for _ in 0..20_000 {
+                core.send(Command::CancelConnection {
+                    cluster: "nowhere".into(),
+                    generation: 0,
+                });
+                drop(core.keep_watching());
+            }
+        };
+        // Refused with an error naming the cluster: a marker in the event order.
+        let marker = |cluster: &str| Command::SetAiExposed {
+            cluster: cluster.into(),
+            server: Some("https://elsewhere".into()),
+            scope: Default::default(),
+        };
+        flood(&core);
+        core.send(marker("one"));
+        core.send(Command::SetAppearance(Appearance::Dark));
+        let write = core.write_client("one", None);
+        core.send(marker("two"));
+        flood(&core);
+
+        let answer = tokio::time::timeout(Duration::from_secs(30), write)
+            .await
+            .expect("the gate answers");
+        // Answered by the gate (a protected, unconnected cluster), not lost with the core.
+        assert!(
+            matches!(&answer, Err(WriteRefusal::Protected { cluster }) if cluster == "one"),
+            "{:?}",
+            answer.map(|_| ())
+        );
+
+        let mut seen: Vec<String> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !seen.iter().any(|e| e.contains("\"two\"")) {
+                match events.recv().await.expect("the core runs") {
+                    Event::Error(message) => seen.push(message),
+                    Event::SettingsChanged { settings, .. }
+                        if settings.appearance == Appearance::Dark =>
+                    {
+                        seen.push("dark".to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("both markers arrive");
+        let first = |want: &dyn Fn(&String) -> bool| seen.iter().position(want).unwrap();
+        let one = first(&|e| e.contains("\"one\""));
+        let dark = first(&|e| e == "dark");
+        let two = first(&|e| e.contains("\"two\""));
+        assert!(one < dark && dark < two, "{seen:?}");
+        assert_eq!(seen.iter().filter(|e| e.contains("\"one\"")).count(), 1);
+        assert_eq!(seen.iter().filter(|e| e.contains("\"two\"")).count(), 1);
+        let on_disk = crate::settings::load_settings(&config).unwrap();
+        assert_eq!(on_disk.appearance, Appearance::Dark);
     }
 
     // Quit returns only after waiting for a plugin still running, and no longer than its bound.

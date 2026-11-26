@@ -1526,6 +1526,7 @@ impl ClusterManager {
         self.settings_error = error;
         self.log_budget.set_limit(self.settings.log_total_bytes());
         self.apply_pending_thresholds();
+        self.apply_history_windows();
         // The watch mode may have changed: start and stop the watches first, so a front end
         // that reads the stores when it hears of the change (the resource switcher) finds
         // them as the new settings have them.
@@ -2701,7 +2702,8 @@ impl ClusterManager {
             (None, Some(consent)) => self.member_access(id, attempt, consent),
             (None, None) => CredentialAccess::new(Arc::new(ForegroundOnly), role),
         };
-        let no_prompt = access.unattended().then(|| {
+        // A kept connection's program and one signed in once from the set view get no input.
+        let no_prompt = access.takes_no_input().then(|| {
             let mut merged = kubeconfig.merged.clone();
             cluster::disable_interactive_exec(&mut merged);
             merged
@@ -5209,7 +5211,7 @@ mod tests {
         let unlocks = manager.unlocks.clone();
         unlocks.unlock("dev", "https://remote-a");
         let pin = manager.contexts.pin_confirmed("dev");
-        let (requests, inbox) = async_channel::bounded(8);
+        let (requests, inbox) = crate::core_queue::CoreQueue::new();
         let check = crate::handle::launch_check(requests, "dev".into(), pin);
         let protected = Err(WriteRefusal::Protected {
             cluster: "dev".into(),
